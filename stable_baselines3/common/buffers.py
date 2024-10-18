@@ -6,10 +6,12 @@ import numpy as np
 import torch as th
 from gymnasium import spaces
 
-from stable_baselines3.common.preprocessing import get_action_dim, get_obs_shape
+from stable_baselines3.common.preprocessing import get_action_dim, get_obs_shape, get_act_shape
 from stable_baselines3.common.type_aliases import (
     DictReplayBufferSamples,
     DictRolloutBufferSamples,
+    HybridRolloutBufferSamples,
+    HybridDictRolloutBufferSamples,
     ReplayBufferSamples,
     RolloutBufferSamples,
 )
@@ -37,6 +39,7 @@ class BaseBuffer(ABC):
 
     observation_space: spaces.Space
     obs_shape: Tuple[int, ...]
+    act_shape: Tuple[int, ...]
 
     def __init__(
         self,
@@ -52,7 +55,8 @@ class BaseBuffer(ABC):
         self.action_space = action_space
         self.obs_shape = get_obs_shape(observation_space)  # type: ignore[assignment]
 
-        self.action_dim = get_action_dim(action_space)
+        # self.action_dim = get_action_dim(action_space)
+        self.act_shape = get_act_shape(action_space)
         self.pos = 0
         self.full = False
         self.device = get_device(device)
@@ -216,7 +220,7 @@ class ReplayBuffer(BaseBuffer):
             self.next_observations = np.zeros((self.buffer_size, self.n_envs, *self.obs_shape), dtype=observation_space.dtype)
 
         self.actions = np.zeros(
-            (self.buffer_size, self.n_envs, self.action_dim), dtype=self._maybe_cast_dtype(action_space.dtype)
+            (self.buffer_size, self.n_envs, *self.act_shape), dtype=self._maybe_cast_dtype(action_space.dtype)
         )
 
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
@@ -259,7 +263,7 @@ class ReplayBuffer(BaseBuffer):
             next_obs = next_obs.reshape((self.n_envs, *self.obs_shape))
 
         # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
-        action = action.reshape((self.n_envs, self.action_dim))
+        action = action.reshape((self.n_envs, *self.act_shape))
 
         # Copy to avoid modification by reference
         self.observations[self.pos] = np.array(obs)
@@ -389,7 +393,7 @@ class RolloutBuffer(BaseBuffer):
 
     def reset(self) -> None:
         self.observations = np.zeros((self.buffer_size, self.n_envs, *self.obs_shape), dtype=np.float32)
-        self.actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=np.float32)
+        self.actions = np.zeros((self.buffer_size, self.n_envs, *self.act_shape), dtype=np.float32)
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.returns = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.episode_starts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
@@ -465,7 +469,7 @@ class RolloutBuffer(BaseBuffer):
             obs = obs.reshape((self.n_envs, *self.obs_shape))
 
         # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
-        action = action.reshape((self.n_envs, self.action_dim))
+        action = action.reshape((self.n_envs, *self.act_shape))
 
         self.observations[self.pos] = np.array(obs)
         self.actions[self.pos] = np.array(action)
@@ -576,7 +580,7 @@ class DictReplayBuffer(ReplayBuffer):
         }
 
         self.actions = np.zeros(
-            (self.buffer_size, self.n_envs, self.action_dim), dtype=self._maybe_cast_dtype(action_space.dtype)
+            (self.buffer_size, self.n_envs, *self.act_shape), dtype=self._maybe_cast_dtype(action_space.dtype)
         )
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
@@ -630,7 +634,7 @@ class DictReplayBuffer(ReplayBuffer):
             self.next_observations[key][self.pos] = np.array(next_obs[key])
 
         # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
-        action = action.reshape((self.n_envs, self.action_dim))
+        action = action.reshape((self.n_envs, *self.act_shape))
 
         self.actions[self.pos] = np.array(action)
         self.rewards[self.pos] = np.array(reward)
@@ -745,7 +749,7 @@ class DictRolloutBuffer(RolloutBuffer):
         self.observations = {}
         for key, obs_input_shape in self.obs_shape.items():
             self.observations[key] = np.zeros((self.buffer_size, self.n_envs, *obs_input_shape), dtype=np.float32)
-        self.actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=np.float32)
+        self.actions = np.zeros((self.buffer_size, self.n_envs, *self.act_shape), dtype=np.float32)
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.returns = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.episode_starts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
@@ -787,7 +791,7 @@ class DictRolloutBuffer(RolloutBuffer):
             self.observations[key][self.pos] = obs_
 
         # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
-        action = action.reshape((self.n_envs, self.action_dim))
+        action = action.reshape((self.n_envs, *self.act_shape))
 
         self.actions[self.pos] = np.array(action)
         self.rewards[self.pos] = np.array(reward)
@@ -801,7 +805,7 @@ class DictRolloutBuffer(RolloutBuffer):
     def get(  # type: ignore[override]
         self,
         batch_size: Optional[int] = None,
-    ) -> Generator[DictRolloutBufferSamples, None, None]:
+    ) -> Generator[HybridDictRolloutBufferSamples, None, None]:
         assert self.full, ""
         indices = np.random.permutation(self.buffer_size * self.n_envs)
         # Prepare the data
@@ -834,6 +838,327 @@ class DictRolloutBuffer(RolloutBuffer):
             actions=self.to_torch(self.actions[batch_inds]),
             old_values=self.to_torch(self.values[batch_inds].flatten()),
             old_log_prob=self.to_torch(self.log_probs[batch_inds].flatten()),
+            advantages=self.to_torch(self.advantages[batch_inds].flatten()),
+            returns=self.to_torch(self.returns[batch_inds].flatten()),
+        )
+
+
+# TODO: support parameterized action (action space is Dict)
+class HybridRolloutBuffer(RolloutBuffer):
+    """
+    Hybrid Rollout buffer used in on-policy algorithms coping with parameterized actions, like HPPOs.
+    Extends the RolloutBuffer to use parameterized action space
+
+    It corresponds to ``buffer_size`` transitions collected
+    using the current policy.
+    This experience will be discarded after the policy update.
+    In order to use PPO objective, we also store the current value of each state
+    and the log probability of each taken action.
+
+    The term rollout here refers to the model-free notion and should not
+    be used with the concept of rollout used in model-based RL or planning.
+    Hence, it is only involved in policy and value function training but not action selection.
+
+    :param buffer_size: Max number of element in the buffer
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param device: PyTorch device
+    :param gae_lambda: Factor for trade-off of bias vs variance for Generalized Advantage Estimator
+        Equivalent to Monte-Carlo advantage estimate when set to 1.
+    :param gamma: Discount factor
+    :param n_envs: Number of parallel environments
+    """
+
+    action_space: spaces.Dict
+    act_shape: Dict[str, Tuple[int, ...]]  # type: ignore[assignment]
+    actions: Dict[str, np.ndarray]  # type: ignore[assignment]
+    log_probs: Dict[str, np.ndarray]
+
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_space: spaces.Space,
+        action_space: spaces.Dict,
+        device: Union[th.device, str] = "auto",
+        gae_lambda: float = 1,
+        gamma: float = 0.99,
+        n_envs: int = 1,
+    ):
+        super(RolloutBuffer, self).__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
+
+        assert isinstance(self.act_shape, dict), "HybridRolloutBuffer must be used with Dict act space only"
+
+        self.gae_lambda = gae_lambda
+        self.gamma = gamma
+
+        self.generator_ready = False
+        self.reset()
+
+    def reset(self) -> None:
+        self.observations = np.zeros((self.buffer_size, self.n_envs, *self.obs_shape), dtype=np.float32)
+        self.actions = {}
+        for key, act_input_shape in self.act_shape.items():
+            self.actions[key] = np.zeros((self.buffer_size, self.n_envs, *act_input_shape), dtype=np.float32)
+        self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.returns = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.episode_starts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.values = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.log_probs = {}
+        for key, _ in self.act_shape.items():
+            self.log_probs[key] = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.advantages = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.generator_ready = False
+        super(RolloutBuffer, self).reset()
+
+    def add(  # type: ignore[override]
+        self,
+        obs: np.ndarray,
+        action: Dict[str, np.ndarray],
+        reward: np.ndarray,
+        episode_start: np.ndarray,
+        value: th.Tensor,
+        log_prob: Dict[str, th.Tensor],
+    ) -> None:
+        """
+        :param obs: Observation
+        :param action: Action
+        :param reward:
+        :param episode_start: Start of episode signal.
+        :param value: estimated value of the current state
+            following the current policy.
+        :param log_prob: log probability of the action
+            following the current policy.
+        """
+        for key, log_prob_ in log_prob.items():
+            if len(log_prob_.shape) == 0:
+                # Reshape 0-d tensor to avoid error
+                log_prob_ = log_prob_.reshape(-1, 1)
+            self.log_probs[key][self.pos] = log_prob_.clone().cpu().numpy()
+
+        # Reshape needed when using multiple envs with discrete observations
+        # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
+        if isinstance(self.observation_space, spaces.Discrete):
+            obs = obs.reshape((self.n_envs, *self.obs_shape))
+
+        for key in self.actions.keys():
+            act_ = np.array(action[key])
+            # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
+            act_ = act_.reshape((self.n_envs, *self.act_shape[key]))
+            self.actions[key][self.pos] = act_
+
+        self.observations[self.pos] = np.array(obs)
+        self.rewards[self.pos] = np.array(reward)
+        self.episode_starts[self.pos] = np.array(episode_start)
+        self.values[self.pos] = value.clone().cpu().numpy().flatten()
+        self.pos += 1
+        if self.pos == self.buffer_size:
+            self.full = True
+
+    def get(  # type: ignore[override]
+        self,
+        batch_size: Optional[int] = None,
+    ) -> Generator[HybridRolloutBufferSamples, None, None]:
+        assert self.full, ""
+        indices = np.random.permutation(self.buffer_size * self.n_envs)
+        # Prepare the data
+        if not self.generator_ready:
+            for key, act in self.actions.items():
+                self.actions[key] = self.swap_and_flatten(act)
+            
+            for key, log_prob in self.log_probs.items():
+                self.log_probs[key] = self.swap_and_flatten(log_prob)
+
+            _tensor_names = ["observations", "values", "advantages", "returns"]
+
+            for tensor in _tensor_names:
+                self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
+            self.generator_ready = True
+
+        # Return everything, don't create minibatches
+        if batch_size is None:
+            batch_size = self.buffer_size * self.n_envs
+
+        start_idx = 0
+        while start_idx < self.buffer_size * self.n_envs:
+            yield self._get_samples(indices[start_idx : start_idx + batch_size])
+            start_idx += batch_size
+
+    def _get_samples(  # type: ignore[override]
+        self,
+        batch_inds: np.ndarray,
+        env: Optional[VecNormalize] = None,
+    ) -> HybridRolloutBufferSamples:
+        return HybridRolloutBufferSamples(
+            observations=self.to_torch(self.observations[batch_inds]),
+            actions={key: self.to_torch(act[batch_inds]) for (key, act) in self.actions.items()},
+            old_values=self.to_torch(self.values[batch_inds].flatten()),
+            old_log_prob={key: self.to_torch(log_prob[batch_inds]) for (key, log_prob) in self.log_probs.items()},
+            advantages=self.to_torch(self.advantages[batch_inds].flatten()),
+            returns=self.to_torch(self.returns[batch_inds].flatten()),
+        )
+
+
+# TODO: support parameterized action (action space is Dict and obs space is also Dict)
+class HybridDictRolloutBuffer(RolloutBuffer):
+    """
+    Hybrid Rollout buffer used in on-policy algorithms coping with parameterized actions, like HPPOs.
+    Extends the RolloutBuffer to use parameterized action space and dictionary observations
+
+    It corresponds to ``buffer_size`` transitions collected
+    using the current policy.
+    This experience will be discarded after the policy update.
+    In order to use PPO objective, we also store the current value of each state
+    and the log probability of each taken action.
+
+    The term rollout here refers to the model-free notion and should not
+    be used with the concept of rollout used in model-based RL or planning.
+    Hence, it is only involved in policy and value function training but not action selection.
+
+    :param buffer_size: Max number of element in the buffer
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param device: PyTorch device
+    :param gae_lambda: Factor for trade-off of bias vs variance for Generalized Advantage Estimator
+        Equivalent to Monte-Carlo advantage estimate when set to 1.
+    :param gamma: Discount factor
+    :param n_envs: Number of parallel environments
+    """
+
+    action_space: spaces.Dict
+    act_shape: Dict[str, Tuple[int, ...]]  # type: ignore[assignment]
+    actions: Dict[str, np.ndarray]  # type: ignore[assignment]
+    log_probs: Dict[str, np.ndarray]
+    observation_space: spaces.Dict
+    obs_shape: Dict[str, Tuple[int, ...]]  # type: ignore[assignment]
+    observations: Dict[str, np.ndarray]  # type: ignore[assignment]
+
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_space: spaces.Dict,
+        action_space: spaces.Dict,
+        device: Union[th.device, str] = "auto",
+        gae_lambda: float = 1,
+        gamma: float = 0.99,
+        n_envs: int = 1,
+    ):
+        super(RolloutBuffer, self).__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
+
+        assert isinstance(self.act_shape, dict), "HybridRolloutBuffer must be used with Dict act space only"
+        assert isinstance(self.obs_shape, dict), "HybridDictRolloutBuffer must be used with Dict obs space only"
+
+        self.gae_lambda = gae_lambda
+        self.gamma = gamma
+
+        self.generator_ready = False
+        self.reset()
+
+    def reset(self) -> None:
+        self.observations = {}
+        for key, obs_input_shape in self.obs_shape.items():
+            self.observations[key] = np.zeros((self.buffer_size, self.n_envs, *obs_input_shape), dtype=np.float32)
+        self.actions = {}
+        for key, act_input_shape in self.act_shape.items():
+            self.actions[key] = np.zeros((self.buffer_size, self.n_envs, *act_input_shape), dtype=np.float32)
+        self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.returns = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.episode_starts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.values = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.log_probs = {}
+        for key, _ in self.act_shape.items():
+            self.log_probs[key] = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.advantages = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.generator_ready = False
+        super(RolloutBuffer, self).reset()
+
+    def add(  # type: ignore[override]
+        self,
+        obs: np.ndarray,
+        action: Dict[str, np.ndarray],
+        reward: np.ndarray,
+        episode_start: np.ndarray,
+        value: th.Tensor,
+        log_prob: Dict[str, th.Tensor],
+    ) -> None:
+        """
+        :param obs: Observation
+        :param action: Action
+        :param reward:
+        :param episode_start: Start of episode signal.
+        :param value: estimated value of the current state
+            following the current policy.
+        :param log_prob: log probability of the action
+            following the current policy.
+        """
+        for key, log_prob_ in log_prob.items():
+            if len(log_prob_.shape) == 0:
+                # Reshape 0-d tensor to avoid error
+                log_prob_ = log_prob_.reshape(-1, 1)
+            self.log_probs[key][self.pos] = log_prob_.clone().cpu().numpy()
+
+        for key in self.observations.keys():
+            obs_ = np.array(obs[key])
+            # Reshape needed when using multiple envs with discrete observations
+            # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
+            if isinstance(self.observation_space.spaces[key], spaces.Discrete):
+                obs_ = obs_.reshape((self.n_envs,) + self.obs_shape[key])
+            self.observations[key][self.pos] = obs_
+
+        for key in self.actions.keys():
+            act_ = np.array(action[key])
+            # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
+            act_ = act_.reshape((self.n_envs, *self.act_shape[key]))
+            self.actions[key][self.pos] = act_
+
+        self.rewards[self.pos] = np.array(reward)
+        self.episode_starts[self.pos] = np.array(episode_start)
+        self.values[self.pos] = value.clone().cpu().numpy().flatten()
+        self.pos += 1
+        if self.pos == self.buffer_size:
+            self.full = True
+
+    def get(  # type: ignore[override]
+        self,
+        batch_size: Optional[int] = None,
+    ) -> Generator[HybridRolloutBufferSamples, None, None]:
+        assert self.full, ""
+        indices = np.random.permutation(self.buffer_size * self.n_envs)
+        # Prepare the data
+        if not self.generator_ready:
+            for key, obs in self.observations.items():
+                self.observations[key] = self.swap_and_flatten(obs)
+
+            for key, act in self.actions.items():
+                self.actions[key] = self.swap_and_flatten(act)
+            
+            for key, log_prob in self.log_probs.items():
+                self.log_probs[key] = self.swap_and_flatten(log_prob)
+
+            _tensor_names = ["values", "advantages", "returns"]
+
+            for tensor in _tensor_names:
+                self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
+            self.generator_ready = True
+
+        # Return everything, don't create minibatches
+        if batch_size is None:
+            batch_size = self.buffer_size * self.n_envs
+
+        start_idx = 0
+        while start_idx < self.buffer_size * self.n_envs:
+            yield self._get_samples(indices[start_idx : start_idx + batch_size])
+            start_idx += batch_size
+
+    def _get_samples(  # type: ignore[override]
+        self,
+        batch_inds: np.ndarray,
+        env: Optional[VecNormalize] = None,
+    ) -> HybridDictRolloutBufferSamples:
+        return HybridDictRolloutBufferSamples(
+            observations={key: self.to_torch(obs[batch_inds]) for (key, obs) in self.observations.items()},
+            actions={key: self.to_torch(act[batch_inds]) for (key, act) in self.actions.items()},
+            old_values=self.to_torch(self.values[batch_inds].flatten()),
+            old_log_prob={key: self.to_torch(log_prob[batch_inds]) for (key, log_prob) in self.log_probs.items()},
             advantages=self.to_torch(self.advantages[batch_inds].flatten()),
             returns=self.to_torch(self.returns[batch_inds].flatten()),
         )

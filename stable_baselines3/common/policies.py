@@ -30,7 +30,7 @@ from stable_baselines3.common.torch_layers import (
     NatureCNN,
     create_mlp,
 )
-from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
+from stable_baselines3.common.type_aliases import PyTorchObs, PyTorchAct, Schedule
 from stable_baselines3.common.utils import get_device, is_vectorized_observation, obs_as_tensor
 
 SelfBaseModel = TypeVar("SelfBaseModel", bound="BaseModel")
@@ -316,7 +316,7 @@ class BasePolicy(BaseModel, ABC):
                 module.bias.data.fill_(0.0)
 
     @abstractmethod
-    def _predict(self, observation: PyTorchObs, deterministic: bool = False) -> th.Tensor:
+    def _predict(self, observation: PyTorchObs, deterministic: bool = False) -> Union[th.Tensor, PyTorchAct]:
         """
         Get the action according to the policy for a given observation.
 
@@ -366,9 +366,16 @@ class BasePolicy(BaseModel, ABC):
 
         with th.no_grad():
             actions = self._predict(obs_tensor, deterministic=deterministic)
-        # Convert to numpy, and reshape to the original action shape
-        actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))  # type: ignore[misc, assignment]
 
+        # TODO: cope with parameterized action space 
+        # Convert tensor to numpy, and reshape to the original action shape
+        if isinstance(self.action_space, spaces.Dict):
+            for key, act in actions.items():
+                actions[key] = act.cpu().numpy().reshape((-1, *self.action_space.spaces[key].shape))
+        else:
+            actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))  # type: ignore[misc, assignment]
+
+        # TODO: cope with parameterized action space 
         if isinstance(self.action_space, spaces.Box):
             if self.squash_output:
                 # Rescale to proper domain when using squashing
@@ -377,11 +384,26 @@ class BasePolicy(BaseModel, ABC):
                 # Actions could be on arbitrary scale, so clip the actions to avoid
                 # out of bound error (e.g. if sampling from a Gaussian distribution)
                 actions = np.clip(actions, self.action_space.low, self.action_space.high)  # type: ignore[assignment, arg-type]
+        elif isinstance(self.action_space, spaces.Dict):
+            for key, act in actions.items():
+                if isinstance(self.action_space.spaces[key], spaces.Box):
+                    if self.squash_output:
+                        # Rescale to proper domain when using squashing
+                        act = self.unscale_action(act)  # type: ignore[assignment, arg-type]
+                    else:
+                        # Actions could be on arbitrary scale, so clip the actions to avoid
+                        # out of bound error (e.g. if sampling from a Gaussian distribution)
+                        act = np.clip(act, self.action_space.spaces[key].low, self.action_space.spaces[key].high)  # type: ignore[assignment, arg-type]
 
         # Remove batch dimension if needed
         if not vectorized_env:
-            assert isinstance(actions, np.ndarray)
-            actions = actions.squeeze(axis=0)
+            if isinstance(actions, np.ndarray):
+                actions = actions.squeeze(axis=0)
+            elif isinstance(actions, Dict[str, np.ndarray]):
+                for _, act in actions.items():
+                    act = act.squeeze(axis=0)
+            else:
+                raise ValueError("Invalid action type. When not using vectorized environment, actions must be a numpy array or a dict of numpy arrays.")
 
         return actions, state  # type: ignore[return-value]
 
@@ -530,6 +552,7 @@ class ActorCriticPolicy(BasePolicy):
         self.dist_kwargs = dist_kwargs
 
         # Action distribution
+        # TODO: Two distributions for discrete and continuous actions
         self.action_dist = make_proba_distribution(action_space, use_sde=use_sde, dist_kwargs=dist_kwargs)
 
         self._build(lr_schedule)
@@ -592,7 +615,8 @@ class ActorCriticPolicy(BasePolicy):
         self._build_mlp_extractor()
 
         latent_dim_pi = self.mlp_extractor.latent_dim_pi
-
+        
+        # TODO: create two types of action net
         if isinstance(self.action_dist, DiagGaussianDistribution):
             self.action_net, self.log_std = self.action_dist.proba_distribution_net(
                 latent_dim=latent_dim_pi, log_std_init=self.log_std_init
@@ -651,6 +675,8 @@ class ActorCriticPolicy(BasePolicy):
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         # Evaluate the values for the given observations
         values = self.value_net(latent_vf)
+        
+        # TODO: Two types of distribution, and joint them
         distribution = self._get_action_dist_from_latent(latent_pi)
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
@@ -681,6 +707,7 @@ class ActorCriticPolicy(BasePolicy):
             vf_features = super().extract_features(obs, self.vf_features_extractor)
             return pi_features, vf_features
 
+    # TODO: Two types of distribution
     def _get_action_dist_from_latent(self, latent_pi: th.Tensor) -> Distribution:
         """
         Retrieve action distribution given the latent codes.
@@ -705,7 +732,8 @@ class ActorCriticPolicy(BasePolicy):
             return self.action_dist.proba_distribution(mean_actions, self.log_std, latent_pi)
         else:
             raise ValueError("Invalid action distribution")
-
+    
+    # TODO: predict discrete action and its' parameters respectively, and joint them
     def _predict(self, observation: PyTorchObs, deterministic: bool = False) -> th.Tensor:
         """
         Get the action according to the policy for a given observation.
@@ -716,6 +744,7 @@ class ActorCriticPolicy(BasePolicy):
         """
         return self.get_distribution(observation).get_actions(deterministic=deterministic)
 
+    # TODO: evaluate discrete action and its' parameters respectively
     def evaluate_actions(self, obs: PyTorchObs, actions: th.Tensor) -> Tuple[th.Tensor, th.Tensor, Optional[th.Tensor]]:
         """
         Evaluate actions according to the current policy,
@@ -740,6 +769,7 @@ class ActorCriticPolicy(BasePolicy):
         entropy = distribution.entropy()
         return values, log_prob, entropy
 
+    # TODO: return two types of distribution
     def get_distribution(self, obs: PyTorchObs) -> Distribution:
         """
         Get the current policy distribution given the observations.

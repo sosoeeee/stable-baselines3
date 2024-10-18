@@ -210,6 +210,32 @@ def get_action_dim(action_space: spaces.Space) -> int:
     else:
         raise NotImplementedError(f"{action_space} action space is not supported")
 
+def get_act_shape(
+    action_space: spaces.Space,
+) -> Union[Tuple[int, ...], Dict[str, Tuple[int, ...]]]:
+    """
+    Get the shape of the action (useful for the buffers).
+
+    :param action_space:
+    :return:
+    """
+    if isinstance(action_space, spaces.Box):
+        return action_space.shape
+    elif isinstance(action_space, spaces.Discrete):
+        # Observation is an int
+        return (1,)
+    elif isinstance(action_space, spaces.MultiDiscrete):
+        # Number of discrete features
+        return (int(len(action_space.nvec)),)
+    elif isinstance(action_space, spaces.MultiBinary):
+        # Number of binary features
+        return action_space.shape
+    elif isinstance(action_space, spaces.Dict):
+        return {key: get_act_shape(subspace) for (key, subspace) in action_space.spaces.items()}  # type: ignore[misc]
+
+    else:
+        raise NotImplementedError(f"{action_space} action space is not supported")
+
 
 def check_for_nested_spaces(obs_space: spaces.Space) -> None:
     """

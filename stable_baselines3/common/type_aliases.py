@@ -22,6 +22,7 @@ TensorDict = Dict[str, th.Tensor]
 OptimizerStateDict = Dict[str, Any]
 MaybeCallback = Union[None, Callable, List["BaseCallback"], "BaseCallback"]
 PyTorchObs = Union[th.Tensor, TensorDict]
+PyTorchAct = Union[th.Tensor, TensorDict]
 
 # A schedule takes the remaining progress as input
 # and outputs a scalar (e.g. learning rate, clip range, ...)
@@ -45,6 +46,21 @@ class DictRolloutBufferSamples(NamedTuple):
     advantages: th.Tensor
     returns: th.Tensor
 
+class HybridRolloutBufferSamples(NamedTuple):
+    observations: th.Tensor
+    actions: TensorDict
+    old_values: th.Tensor
+    old_log_prob: TensorDict
+    advantages: th.Tensor
+    returns: th.Tensor
+
+class HybridDictRolloutBufferSamples(NamedTuple):
+    observations: TensorDict
+    actions: TensorDict
+    old_values: th.Tensor
+    old_log_prob: TensorDict
+    advantages: th.Tensor
+    returns: th.Tensor
 
 class ReplayBufferSamples(NamedTuple):
     observations: th.Tensor

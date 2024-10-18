@@ -8,9 +8,10 @@ import torch as th
 from gymnasium import spaces
 
 from stable_baselines3.common.base_class import BaseAlgorithm
-from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer
+from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer, HybridRolloutBuffer, HybridDictRolloutBuffer
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.hppo.policies import HybridActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import obs_as_tensor, safe_mean
 from stable_baselines3.common.vec_env import VecEnv
@@ -56,11 +57,11 @@ class OnPolicyAlgorithm(BaseAlgorithm):
     """
 
     rollout_buffer: RolloutBuffer
-    policy: ActorCriticPolicy
+    policy: Union[ActorCriticPolicy, HybridActorCriticPolicy]
 
     def __init__(
         self,
-        policy: Union[str, Type[ActorCriticPolicy]],
+        policy: Union[str, Type[ActorCriticPolicy], Type[HybridActorCriticPolicy]],
         env: Union[GymEnv, str],
         learning_rate: Union[float, Schedule],
         n_steps: int,
@@ -116,9 +117,15 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         self._setup_lr_schedule()
         self.set_random_seed(self.seed)
 
+        # TODO: when self.action_space is Dice, use DictRolloutBuffer also
         if self.rollout_buffer_class is None:
             if isinstance(self.observation_space, spaces.Dict):
-                self.rollout_buffer_class = DictRolloutBuffer
+                if isinstance(self.action_space, spaces.Dict):
+                    self.rollout_buffer_class = HybridDictRolloutBuffer
+                else:
+                    self.rollout_buffer_class = DictRolloutBuffer
+            elif isinstance(self.action_space, spaces.Dict):
+                self.rollout_buffer_class = HybridRolloutBuffer
             else:
                 self.rollout_buffer_class = RolloutBuffer
 
@@ -200,11 +207,21 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
                 actions, values, log_probs = self.policy(obs_tensor)
-            actions = actions.cpu().numpy()
+            
+            # tensor --> numpy
+            if isinstance(self.action_space, spaces.Dict):
+                for _, act in actions.items():
+                    act = act.cpu().numpy()  
+            else:
+                actions = actions.cpu().numpy()
 
             # Rescale and perform action
             clipped_actions = actions
 
+            # TODO: cope with parameterized action space 
+            # When coping with parameterizedf action space, space.Dist has two keys, which are
+            # policy.d_key with corresponding space shape of space.Discrete,
+            # policy.c_key with corresponding space shape of all discrete actions
             if isinstance(self.action_space, spaces.Box):
                 if self.policy.squash_output:
                     # Unscale the actions to match env bounds
@@ -214,6 +231,16 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                     # Otherwise, clip the actions to avoid out of bound error
                     # as we are sampling from an unbounded Gaussian distribution
                     clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
+            elif isinstance(self.action_space, spaces.Dict):
+                for key, act in clipped_actions.items():
+                    if isinstance(self.action_space.spaces[key], spaces.Box):
+                        if self.squash_output:
+                            # Rescale to proper domain when using squashing
+                            act = self.unscale_action(act)  # type: ignore[assignment, arg-type]
+                        else:
+                            # Actions could be on arbitrary scale, so clip the actions to avoid
+                            # out of bound error (e.g. if sampling from a Gaussian distribution)
+                            act = np.clip(act, self.action_space.spaces[key].low, self.action_space.spaces[key].high)  # type: ignore[assignment, arg-type]
 
             new_obs, rewards, dones, infos = env.step(clipped_actions)
 

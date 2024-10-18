@@ -9,15 +9,15 @@ from torch.nn import functional as F
 from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 # TODO: change policy networks
-from stable_baselines3.common.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, MultiInputActorCriticPolicy
+from stable_baselines3.hppo.policies import HybridActorCriticPolicy, HybridActorCriticCnnPolicy, MultiInputHybridActorCriticPolicy, BasePolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import explained_variance, get_schedule_fn
 
 # TODO: change to HPPO
-SelfPPO = TypeVar("SelfPPO", bound="PPO")
+SelfHPPO = TypeVar("SelfHPPO", bound="HPPO")
 
 
-class PPO(OnPolicyAlgorithm):
+class HPPO(OnPolicyAlgorithm):
     """
     Proximal Policy Optimization algorithm (PPO) (clip version)
 
@@ -75,14 +75,14 @@ class PPO(OnPolicyAlgorithm):
 
     # TODO: change policy networks
     policy_aliases: ClassVar[Dict[str, Type[BasePolicy]]] = {
-        "MlpPolicy": ActorCriticPolicy,
-        "CnnPolicy": ActorCriticCnnPolicy,
-        "MultiInputPolicy": MultiInputActorCriticPolicy,
+        "MlpPolicy": HybridActorCriticPolicy,
+        "CnnPolicy": HybridActorCriticCnnPolicy,
+        "MultiInputPolicy": MultiInputHybridActorCriticPolicy,
     }
 
     def __init__(
         self,
-        policy: Union[str, Type[ActorCriticPolicy]],
+        policy: Union[str, Type[HybridActorCriticPolicy]],
         env: Union[GymEnv, str],
         learning_rate: Union[float, Schedule] = 3e-4,
         n_steps: int = 2048,
@@ -208,12 +208,12 @@ class PPO(OnPolicyAlgorithm):
             approx_kl_divs = []
             # Do a complete pass on the rollout buffer
             for rollout_data in self.rollout_buffer.get(self.batch_size):
-                actions = rollout_data.actions  # tensor
+                actions = rollout_data.actions  # TensorDict
+                d_key = self.policy.d_key
+                c_key = self.policy.c_key
 
-                # TODO: handle parameterized action space
-                if isinstance(self.action_space, spaces.Discrete):
-                    # Convert discrete action from float to long
-                    actions = rollout_data.actions.long().flatten()
+                # Convert discrete action from float to long
+                actions[d_key] = actions[d_key].long().flatten()
 
                 values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
                 values = values.flatten()
@@ -225,17 +225,24 @@ class PPO(OnPolicyAlgorithm):
 
                 # compute discrete and contiuous action policys' loss
                 # ratio between old and new policy, should be one at the first iteration
-                ratio = th.exp(log_prob - rollout_data.old_log_prob)
 
+                d_ratio = th.exp(log_prob[d_key] - rollout_data.old_log_prob[d_key])
                 # clipped surrogate loss
-                policy_loss_1 = advantages * ratio
-                policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
-                policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
+                d_policy_loss_1 = advantages * d_ratio
+                d_policy_loss_2 = advantages * th.clamp(d_ratio, 1 - clip_range, 1 + clip_range)
+                d_policy_loss = -th.min(d_policy_loss_1, d_policy_loss_2).mean()
+
+                c_ratio = th.exp(log_prob[c_key] - rollout_data.old_log_prob[c_key])
+                # clipped surrogate loss
+                c_policy_loss_1 = advantages * c_ratio
+                c_policy_loss_2 = advantages * th.clamp(c_ratio, 1 - clip_range, 1 + clip_range)
+                c_policy_loss = -th.min(c_policy_loss_1, c_policy_loss_2).mean()
 
                 # Logging
-                pg_losses.append(policy_loss.item())
-                clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
-                clip_fractions.append(clip_fraction) # how many updating of sampled action was clipped
+                pg_losses.append([d_policy_loss.item(), c_policy_loss.item()])
+                d_clip_fraction = th.mean((th.abs(d_ratio - 1) > clip_range).float()).item()
+                c_clip_fraction = th.mean((th.abs(c_ratio - 1) > clip_range).float()).item()
+                clip_fractions.append([d_clip_fraction, c_clip_fraction]) # how many updating of sampled action was clipped
 
                 if self.clip_range_vf is None:
                     # No clipping
@@ -251,17 +258,13 @@ class PPO(OnPolicyAlgorithm):
                 value_losses.append(value_loss.item())
 
                 # Entropy loss favor exploration
-                if entropy is None:
-                    # Approximate entropy when no analytical form
-                    entropy_loss = -th.mean(-log_prob)
-                else:
-                    # TODO: compute two types of entropy respectively
-                    entropy_loss = -th.mean(entropy)
-
-                entropy_losses.append(entropy_loss.item())
+                # TODO: compute two types of entropy respectively
+                d_entropy_loss = -th.mean(entropy[d_key])
+                c_entropy_loss = -th.mean(entropy[c_key])
+                entropy_losses.append([d_entropy_loss.item(), c_entropy_loss.item()])
 
                 # TODO: expand loss
-                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+                loss = (d_policy_loss + c_policy_loss) + self.ent_coef * (d_entropy_loss + c_entropy_loss) + self.vf_coef * value_loss
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
@@ -269,14 +272,16 @@ class PPO(OnPolicyAlgorithm):
                 # and Schulman blog: http://joschu.net/blog/kl-approx.html
                 # TODO: compute kl indenpendently
                 with th.no_grad():
-                    log_ratio = log_prob - rollout_data.old_log_prob
-                    approx_kl_div = th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
-                    approx_kl_divs.append(approx_kl_div)
+                    d_log_ratio = log_prob[d_key] - rollout_data.old_log_prob[d_key]
+                    d_approx_kl_div = th.mean((th.exp(d_log_ratio) - 1) - d_log_ratio).cpu().numpy()
+                    c_log_ratio = log_prob[c_key] - rollout_data.old_log_prob[c_key]
+                    c_approx_kl_div = th.mean((th.exp(c_log_ratio) - 1) - c_log_ratio).cpu().numpy()
+                    approx_kl_divs.append([d_approx_kl_div, c_approx_kl_div])
 
-                if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
+                if self.target_kl is not None and max(d_approx_kl_div, c_approx_kl_div) > 1.5 * self.target_kl:
                     continue_training = False
                     if self.verbose >= 1:
-                        print(f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}")
+                        print(f"Early stopping at step {epoch} due to reaching max kl: {max(d_approx_kl_div, c_approx_kl_div):.2f}")
                     break
 
                 # Optimization step
@@ -293,7 +298,6 @@ class PPO(OnPolicyAlgorithm):
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
         # Logs
-        # TODO: Add Loss here
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
@@ -310,14 +314,14 @@ class PPO(OnPolicyAlgorithm):
             self.logger.record("train/clip_range_vf", clip_range_vf)
 
     def learn(
-        self: SelfPPO,
+        self: SelfHPPO,
         total_timesteps: int,
         callback: MaybeCallback = None,
         log_interval: int = 1,
         tb_log_name: str = "PPO",
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
-    ) -> SelfPPO:
+    ) -> SelfHPPO:
         return super().learn(
             total_timesteps=total_timesteps,
             callback=callback,
