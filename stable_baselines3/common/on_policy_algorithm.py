@@ -11,9 +11,8 @@ from stable_baselines3.common.base_class import BaseAlgorithm
 from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer, HybridRolloutBuffer, HybridDictRolloutBuffer
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.hppo.policies import HybridActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import obs_as_tensor, safe_mean
+from stable_baselines3.common.utils import obs_as_tensor, safe_mean, separate_action, get_schedule_fn
 from stable_baselines3.common.vec_env import VecEnv
 
 SelfOnPolicyAlgorithm = TypeVar("SelfOnPolicyAlgorithm", bound="OnPolicyAlgorithm")
@@ -57,17 +56,17 @@ class OnPolicyAlgorithm(BaseAlgorithm):
     """
 
     rollout_buffer: RolloutBuffer
-    policy: Union[ActorCriticPolicy, HybridActorCriticPolicy]
+    policy: Union[ActorCriticPolicy]
 
     def __init__(
         self,
-        policy: Union[str, Type[ActorCriticPolicy], Type[HybridActorCriticPolicy]],
+        policy: Union[str, Type[ActorCriticPolicy]],
         env: Union[GymEnv, str],
         learning_rate: Union[float, Schedule],
         n_steps: int,
         gamma: float,
         gae_lambda: float,
-        ent_coef: float,
+        ent_coef: Union[float, Schedule],
         vf_coef: float,
         max_grad_norm: float,
         use_sde: bool,
@@ -115,6 +114,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
 
     def _setup_model(self) -> None:
         self._setup_lr_schedule()
+        self.ent_coef = get_schedule_fn(self.ent_coef)
         self.set_random_seed(self.seed)
 
         # TODO: when self.action_space is Dice, use DictRolloutBuffer also
@@ -209,17 +209,24 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                 actions, values, log_probs = self.policy(obs_tensor)
             
             # tensor --> numpy
+            # if isinstance(self.action_space, spaces.Dict):
+            #     for key, act in actions.items():
+            #         actions[key] = act.cpu().numpy()
+            # else:
+            #     actions = actions.cpu().numpy()
+            
+            # Convert tensor to numpy, and reshape to the original action shape
             if isinstance(self.action_space, spaces.Dict):
-                for _, act in actions.items():
-                    act = act.cpu().numpy()  
+                for key, act in actions.items():
+                    actions[key] = act.cpu().numpy().reshape((-1, *self.action_space.spaces[key].shape))
             else:
-                actions = actions.cpu().numpy()
+                actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))  # type: ignore[misc, assignment]
 
             # Rescale and perform action
-            clipped_actions = actions
+            clipped_actions = actions.copy()
 
             # TODO: cope with parameterized action space 
-            # When coping with parameterizedf action space, space.Dist has two keys, which are
+            # When coping with parameterized action space, space.Dist has two keys, which are
             # policy.d_key with corresponding space shape of space.Discrete,
             # policy.c_key with corresponding space shape of all discrete actions
             if isinstance(self.action_space, spaces.Box):
@@ -234,13 +241,20 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             elif isinstance(self.action_space, spaces.Dict):
                 for key, act in clipped_actions.items():
                     if isinstance(self.action_space.spaces[key], spaces.Box):
-                        if self.squash_output:
+                        if self.policy.squash_output:
                             # Rescale to proper domain when using squashing
-                            act = self.unscale_action(act)  # type: ignore[assignment, arg-type]
+                            clipped_actions[key] = self.unscale_action(act)  # type: ignore[assignment, arg-type]
                         else:
                             # Actions could be on arbitrary scale, so clip the actions to avoid
                             # out of bound error (e.g. if sampling from a Gaussian distribution)
-                            act = np.clip(act, self.action_space.spaces[key].low, self.action_space.spaces[key].high)  # type: ignore[assignment, arg-type]
+                            clipped_actions[key] = np.clip(act, self.action_space.spaces[key].low, self.action_space.spaces[key].high)  # type: ignore[assignment, arg-type]
+
+            # TODO: cope with parameterized action space 
+            # Convert to array of dictionaries for vectorized environments
+            if isinstance(self.action_space, spaces.Dict):
+                clipped_actions = [{key: clipped_actions[key][i] for key in clipped_actions} for i in range(len(next(iter(clipped_actions.values()))))]
+                # separate the action on parameters dimension
+                clipped_actions = separate_action(action=clipped_actions)
 
             new_obs, rewards, dones, infos = env.step(clipped_actions)
 
@@ -254,9 +268,14 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             self._update_info_buffer(infos, dones)
             n_steps += 1
 
+            # TODO: cope with parameterized action space 
             if isinstance(self.action_space, spaces.Discrete):
                 # Reshape in case of discrete action
                 actions = actions.reshape(-1, 1)
+            elif isinstance(self.action_space, spaces.Dict):
+                for key, act in actions.items():
+                    if isinstance(self.action_space.spaces[key], spaces.Discrete):
+                        actions[key] = act.reshape(-1, 1)
 
             # Handle timeout by bootstrapping with value function
             # see GitHub issue #633

@@ -1,4 +1,4 @@
-from stable_baselines3.ppo.policies import CnnPolicy, MlpPolicy, MultiInputPolicy
-from stable_baselines3.ppo.ppo import PPO
+from stable_baselines3.hppo.policies import CnnPolicy, MlpPolicy, MultiInputPolicy
+from stable_baselines3.hppo.hppo import HPPO
 
-__all__ = ["CnnPolicy", "MlpPolicy", "MultiInputPolicy", "PPO"]
+__all__ = ["CnnPolicy", "MlpPolicy", "MultiInputPolicy", "HPPO"]

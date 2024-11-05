@@ -31,7 +31,7 @@ from stable_baselines3.common.torch_layers import (
     create_mlp,
 )
 from stable_baselines3.common.type_aliases import PyTorchObs, PyTorchAct, Schedule
-from stable_baselines3.common.utils import get_device, is_vectorized_observation, obs_as_tensor
+from stable_baselines3.common.utils import get_device, is_vectorized_observation, obs_as_tensor, separate_action
 
 SelfBaseModel = TypeVar("SelfBaseModel", bound="BaseModel")
 
@@ -389,21 +389,30 @@ class BasePolicy(BaseModel, ABC):
                 if isinstance(self.action_space.spaces[key], spaces.Box):
                     if self.squash_output:
                         # Rescale to proper domain when using squashing
-                        act = self.unscale_action(act)  # type: ignore[assignment, arg-type]
+                        actions[key] = self.unscale_action(act)  # type: ignore[assignment, arg-type]
                     else:
                         # Actions could be on arbitrary scale, so clip the actions to avoid
                         # out of bound error (e.g. if sampling from a Gaussian distribution)
-                        act = np.clip(act, self.action_space.spaces[key].low, self.action_space.spaces[key].high)  # type: ignore[assignment, arg-type]
+                        actions[key] = np.clip(act, self.action_space.spaces[key].low, self.action_space.spaces[key].high)  # type: ignore[assignment, arg-type]
 
+        # TODO: cope with parameterized action space
         # Remove batch dimension if needed
         if not vectorized_env:
             if isinstance(actions, np.ndarray):
                 actions = actions.squeeze(axis=0)
-            elif isinstance(actions, Dict[str, np.ndarray]):
-                for _, act in actions.items():
-                    act = act.squeeze(axis=0)
+            elif isinstance(self.action_space, spaces.Dict):
+                for key, act in actions.items():
+                    actions[key] = act.squeeze(axis=0)
             else:
                 raise ValueError("Invalid action type. When not using vectorized environment, actions must be a numpy array or a dict of numpy arrays.")
+
+        # TODO: cope with parameterized action space
+        # Convert to array of dictionaries
+        if isinstance(self.action_space, spaces.Dict):
+            actions = [{key: actions[key][i] for key in actions} for i in range(len(next(iter(actions.values()))))]
+            # Attention: the output action is concatenated in the parameters dimension
+            # before the action is passed to the environment, the action should be split
+            actions = separate_action(action=actions)
 
         return actions, state  # type: ignore[return-value]
 

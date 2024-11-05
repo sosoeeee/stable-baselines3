@@ -24,6 +24,11 @@ except ImportError:
 from stable_baselines3.common.logger import Logger, configure
 from stable_baselines3.common.type_aliases import GymEnv, Schedule, TensorDict, TrainFreq, TrainFrequencyUnit
 
+# Global variables for dictionary action space
+TYPE_KEY = None
+PARAMETER_KEY = None
+PARAMETER_INDEX = [0]
+
 
 def set_random_seed(seed: int, using_cuda: bool = False) -> None:
     """
@@ -229,8 +234,9 @@ def check_for_correct_spaces(env: GymEnv, observation_space: spaces.Space, actio
     """
     if observation_space != env.observation_space:
         raise ValueError(f"Observation spaces do not match: {observation_space} != {env.observation_space}")
-    if action_space != env.action_space:
-        raise ValueError(f"Action spaces do not match: {action_space} != {env.action_space}")
+    # TODO: commenr out the following line to allow for action space change in hppo algorithm
+    # if action_space != env.action_space:
+    #     raise ValueError(f"Action spaces do not match: {action_space} != {env.action_space}")
 
 
 def check_shape_equal(space1: spaces.Space, space2: spaces.Space) -> None:
@@ -550,3 +556,84 @@ def get_system_info(print_info: bool = True) -> Tuple[Dict[str, str], str]:
     if print_info:
         print(env_info_str)
     return env_info, env_info_str
+
+
+def reorgnize_action_space(action_space: spaces.Dict):
+    """
+    Reorganize the action space to make it compatible with the model.
+    The parameters are concatenated into a single space.
+    And generate a mask matrix to separate the parameters.
+
+    By default, parameterized action space is a Dictionary, and has one key for action types
+    and n keys for action parameters, where n is the number of action types.
+    ==================================== like ====================================
+    action_space = spaces.Dict({
+        "action_type": spaces.Discrete(2),
+        "action_param0": spaces.Box(low=-1, high=1, shape=(1,)),
+        "action_param1": spaces.Box(low=-1, high=1, shape=(1,))
+    })
+    ==============================================================================
+    this function reorganizes the action space to two keys, one for action types and one for all action parameters
+    """
+
+    assert isinstance(action_space, spaces.Dict), "The action space must be a Dict space."
+
+    # Get the action type
+    parameters_min = []
+    parameters_max = []
+    idx = [0]
+    for key, space in action_space.spaces.items():
+        if isinstance(space, spaces.Discrete):
+            d_key = key
+        else:
+            parameters_min.append(space.low)
+            parameters_max.append(space.high)
+            idx.append(len(space.low) + idx[-1])
+
+    parameters_min = np.concatenate(parameters_min)
+    parameters_max = np.concatenate(parameters_max)
+    parameters_num = len(parameters_min)
+    mask = np.zeros((len(idx) - 1, parameters_num), dtype=np.int8)
+    for i in range(len(idx) - 1):
+        mask[i, idx[i]:idx[i + 1]] = 1
+
+    c_key = "parameters"
+
+    # Generate the new action space
+    action_space = spaces.Dict({
+        d_key: spaces.Discrete(len(idx) - 1),
+        c_key: spaces.Box(parameters_min, parameters_max)
+    })
+
+    return action_space, d_key, c_key, mask
+
+
+def separate_action(action: Optional[Union[Dict, List[Dict]]] = None,
+                    original_action_space: Optional[spaces.Dict] = None):
+    """
+    Separate the concatenated action into the original action space.
+    """
+
+    global TYPE_KEY, PARAMETER_KEY, PARAMETER_INDEX
+    if original_action_space is not None and (TYPE_KEY is None or PARAMETER_KEY is None):
+        for key, space in original_action_space.spaces.items():
+            if isinstance(space, spaces.Discrete):
+                TYPE_KEY = key
+            else:
+                # split number and name
+                if PARAMETER_KEY is None:
+                    PARAMETER_KEY = re.split(r'(\d+)', key)[0]
+                PARAMETER_INDEX.append(len(space.low) + PARAMETER_INDEX[-1])
+        print(f"TYPE_KEY: {TYPE_KEY}, PARAMETER_KEY: {PARAMETER_KEY}, PARAMETER_INDEX: {PARAMETER_INDEX}")
+
+    if action is None:
+        return None
+
+    if isinstance(action, dict):
+        type_ = action[TYPE_KEY]
+        paras_ = action["parameters"][PARAMETER_INDEX[type_]:PARAMETER_INDEX[type_ + 1]]
+        return {TYPE_KEY: type_, PARAMETER_KEY+str(a[TYPE_KEY]): paras_}
+    else:
+        return [{TYPE_KEY: a[TYPE_KEY],
+                 PARAMETER_KEY+str(a[TYPE_KEY]): a["parameters"][PARAMETER_INDEX[a[TYPE_KEY]]:PARAMETER_INDEX[a[TYPE_KEY] + 1]]} for a in
+                action]

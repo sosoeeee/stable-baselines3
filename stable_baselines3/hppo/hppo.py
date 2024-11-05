@@ -11,7 +11,7 @@ from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 # TODO: change policy networks
 from stable_baselines3.hppo.policies import HybridActorCriticPolicy, HybridActorCriticCnnPolicy, MultiInputHybridActorCriticPolicy, BasePolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import explained_variance, get_schedule_fn
+from stable_baselines3.common.utils import explained_variance, get_schedule_fn, reorgnize_action_space, separate_action
 
 # TODO: change to HPPO
 SelfHPPO = TypeVar("SelfHPPO", bound="HPPO")
@@ -93,7 +93,7 @@ class HPPO(OnPolicyAlgorithm):
         clip_range: Union[float, Schedule] = 0.2,
         clip_range_vf: Union[None, float, Schedule] = None,
         normalize_advantage: bool = True,
-        ent_coef: float = 0.0,
+        ent_coef: Union[float, Schedule] = 0.0,
         vf_coef: float = 0.5,
         max_grad_norm: float = 0.5,
         use_sde: bool = False,
@@ -131,12 +131,15 @@ class HPPO(OnPolicyAlgorithm):
             seed=seed,
             _init_setup_model=False,
             supported_action_spaces=(
-                spaces.Box,
-                spaces.Discrete,
-                spaces.MultiDiscrete,
-                spaces.MultiBinary,
+                spaces.Dict,
             ),
         )
+
+        # store the original action space info
+        _ = separate_action(action=None, original_action_space=self.action_space)
+        self.action_space, d_key, c_key, mask = reorgnize_action_space(self.action_space)
+        self.policy_kwargs = policy_kwargs or {}
+        self.policy_kwargs.update({"d_key": d_key, "c_key": c_key, "mask": mask})
 
         # Sanity check, otherwise it will lead to noisy gradient and NaN
         # because of the advantage normalization
@@ -194,23 +197,28 @@ class HPPO(OnPolicyAlgorithm):
         self._update_learning_rate(self.policy.optimizer)
         # Compute current clip range
         clip_range = self.clip_range(self._current_progress_remaining)  # type: ignore[operator]
+        ent_coef = self.ent_coef(self._current_progress_remaining)  # type: ignore[operator]
         # Optional: clip range for the value function
         if self.clip_range_vf is not None:
             clip_range_vf = self.clip_range_vf(self._current_progress_remaining)  # type: ignore[operator]
 
-        entropy_losses = []
-        pg_losses, value_losses = [], []
+        d_entropy_losses = []
+        c_entropy_losses = []
+        d_pg_losses = []
+        c_pg_losses = []
+        value_losses = []
         clip_fractions = []
+        d_approx_kl_divs = []
+        c_approx_kl_divs = []
 
         continue_training = True
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
-            approx_kl_divs = []
             # Do a complete pass on the rollout buffer
             for rollout_data in self.rollout_buffer.get(self.batch_size):
                 actions = rollout_data.actions  # TensorDict
-                d_key = self.policy.d_key
-                c_key = self.policy.c_key
+                d_key = self.policy.get_d_key()
+                c_key = self.policy.get_c_key()
 
                 # Convert discrete action from float to long
                 actions[d_key] = actions[d_key].long().flatten()
@@ -239,7 +247,8 @@ class HPPO(OnPolicyAlgorithm):
                 c_policy_loss = -th.min(c_policy_loss_1, c_policy_loss_2).mean()
 
                 # Logging
-                pg_losses.append([d_policy_loss.item(), c_policy_loss.item()])
+                d_pg_losses.append(d_policy_loss.item())
+                c_pg_losses.append(c_policy_loss.item())
                 d_clip_fraction = th.mean((th.abs(d_ratio - 1) > clip_range).float()).item()
                 c_clip_fraction = th.mean((th.abs(c_ratio - 1) > clip_range).float()).item()
                 clip_fractions.append([d_clip_fraction, c_clip_fraction]) # how many updating of sampled action was clipped
@@ -261,10 +270,11 @@ class HPPO(OnPolicyAlgorithm):
                 # TODO: compute two types of entropy respectively
                 d_entropy_loss = -th.mean(entropy[d_key])
                 c_entropy_loss = -th.mean(entropy[c_key])
-                entropy_losses.append([d_entropy_loss.item(), c_entropy_loss.item()])
+                d_entropy_losses.append(d_entropy_loss.item())
+                c_entropy_losses.append(c_entropy_loss.item())
 
                 # TODO: expand loss
-                loss = (d_policy_loss + c_policy_loss) + self.ent_coef * (d_entropy_loss + c_entropy_loss) + self.vf_coef * value_loss
+                loss = (d_policy_loss + c_policy_loss) + ent_coef * (d_entropy_loss + c_entropy_loss) + self.vf_coef * value_loss
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
@@ -276,7 +286,8 @@ class HPPO(OnPolicyAlgorithm):
                     d_approx_kl_div = th.mean((th.exp(d_log_ratio) - 1) - d_log_ratio).cpu().numpy()
                     c_log_ratio = log_prob[c_key] - rollout_data.old_log_prob[c_key]
                     c_approx_kl_div = th.mean((th.exp(c_log_ratio) - 1) - c_log_ratio).cpu().numpy()
-                    approx_kl_divs.append([d_approx_kl_div, c_approx_kl_div])
+                    d_approx_kl_divs.append(d_approx_kl_div)
+                    c_approx_kl_divs.append(c_approx_kl_div)
 
                 if self.target_kl is not None and max(d_approx_kl_div, c_approx_kl_div) > 1.5 * self.target_kl:
                     continue_training = False
@@ -298,10 +309,13 @@ class HPPO(OnPolicyAlgorithm):
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
         # Logs
-        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
-        self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
+        self.logger.record("train/d_entropy_loss", np.mean(d_entropy_losses))
+        self.logger.record("train/c_entropy_loss", np.mean(c_entropy_losses))
+        self.logger.record("train/d_policy_gradient_loss", np.mean(d_pg_losses))
+        self.logger.record("train/c_policy_gradient_loss", np.mean(c_pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
-        self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
+        self.logger.record("train/d_approx_kl", np.mean(d_approx_kl_divs))
+        self.logger.record("train/c_approx_kl", np.mean(c_approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
         self.logger.record("train/explained_variance", explained_var)

@@ -263,6 +263,87 @@ class MlpExtractor(nn.Module):
         return self.value_net(features)
 
 
+
+class HybridActionMlpExtractor(nn.Module):
+    """
+    Constructs an MLP that receives the output from a previous features extractor, which is latent_pi in hybrid ppo, 
+    as an input and outputs a latent representation for the discrete and continuous action space.
+
+    The ``net_arch`` parameter allows to specify the amount and size of the hidden layers.
+    It can be in either of the following forms:
+    1. ``dict(di=[<list of layer sizes>], co=[<list of layer sizes>])``: to specify the amount and size of the layers in the
+        discrete and continuous action nets individually. If it is missing any of the keys (di or co),
+        zero layers will be considered for that key.
+    2. ``[<list of layer sizes>]``: "shortcut" in case the amount and size of the layers
+        in the discrete and continuous action nets are the same. Same as ``dict(di=int_list, co=int_list)``
+        where int_list is the same for two action nets.
+
+    .. note::
+        If a key is not specified or an empty list is passed ``[]``, a linear network will be used.
+
+    :param feature_dim: Dimension of the feature vector (can be the output of a CNN)
+    :param net_arch: The specification of the policy and value networks.
+        See above for details on its formatting.
+    :param activation_fn: The activation function to use for the networks.
+    :param device: PyTorch device.
+    """
+
+    def __init__(
+        self,
+        feature_dim: int,
+        net_arch: Union[List[int], Dict[str, List[int]]],
+        activation_fn: Type[nn.Module],
+        device: Union[th.device, str] = "auto",
+    ) -> None:
+        super().__init__()
+        device = get_device(device)
+        discrete_action_net: List[nn.Module] = []
+        continuous_action_net: List[nn.Module] = []
+        last_layer_dim_di = feature_dim
+        last_layer_dim_co = feature_dim
+
+        # save dimensions of layers in policy and value nets
+        if isinstance(net_arch, dict):
+            # Note: if key is not specified, assume linear network
+            di_layers_dims = net_arch.get("di", [])  # Layer sizes of the policy network
+            co_layers_dims = net_arch.get("co", [])  # Layer sizes of the value network
+        else:
+            di_layers_dims = co_layers_dims = net_arch
+        # Iterate through the policy layers and build the policy net
+        for curr_layer_dim in di_layers_dims:
+            discrete_action_net.append(nn.Linear(last_layer_dim_di, curr_layer_dim))
+            discrete_action_net.append(activation_fn())
+            last_layer_dim_di = curr_layer_dim
+        # Iterate through the value layers and build the value net
+        for curr_layer_dim in co_layers_dims:
+            continuous_action_net.append(nn.Linear(last_layer_dim_co, curr_layer_dim))
+            continuous_action_net.append(activation_fn())
+            last_layer_dim_co = curr_layer_dim
+
+        # Save dim, used to create the distributions
+        self.latent_dim_di = last_layer_dim_di
+        self.latent_dim_co = last_layer_dim_co
+
+        # Create networks
+        # If the list of layers is empty, the network will just act as an Identity module
+        self.discrete_action_net = nn.Sequential(*discrete_action_net).to(device)
+        self.continuous_action_net = nn.Sequential(*continuous_action_net).to(device)
+
+    def forward(self, features: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
+        """
+        :return: latent_policy, latent_value of the specified network.
+            If all layers are shared, then ``latent_policy == latent_value``
+        """
+        return self.forward_discrete(features), self.forward_continuous(features)
+
+    def forward_discrete(self, features: th.Tensor) -> th.Tensor:
+        return self.discrete_action_net(features)
+
+    def forward_continuous(self, features: th.Tensor) -> th.Tensor:
+        return self.continuous_action_net(features)
+
+
+
 class CombinedExtractor(BaseFeaturesExtractor):
     """
     Combined features extractor for Dict observation spaces.

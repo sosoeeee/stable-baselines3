@@ -992,7 +992,7 @@ class HybridRolloutBuffer(RolloutBuffer):
             observations=self.to_torch(self.observations[batch_inds]),
             actions={key: self.to_torch(act[batch_inds]) for (key, act) in self.actions.items()},
             old_values=self.to_torch(self.values[batch_inds].flatten()),
-            old_log_prob={key: self.to_torch(log_prob[batch_inds]) for (key, log_prob) in self.log_probs.items()},
+            old_log_prob={key: self.to_torch(log_prob[batch_inds].flatten()) for (key, log_prob) in self.log_probs.items()},
             advantages=self.to_torch(self.advantages[batch_inds].flatten()),
             returns=self.to_torch(self.returns[batch_inds].flatten()),
         )
@@ -1158,7 +1158,7 @@ class HybridDictRolloutBuffer(RolloutBuffer):
             observations={key: self.to_torch(obs[batch_inds]) for (key, obs) in self.observations.items()},
             actions={key: self.to_torch(act[batch_inds]) for (key, act) in self.actions.items()},
             old_values=self.to_torch(self.values[batch_inds].flatten()),
-            old_log_prob={key: self.to_torch(log_prob[batch_inds]) for (key, log_prob) in self.log_probs.items()},
+            old_log_prob={key: self.to_torch(log_prob[batch_inds].flatten()) for (key, log_prob) in self.log_probs.items()},
             advantages=self.to_torch(self.advantages[batch_inds].flatten()),
             returns=self.to_torch(self.returns[batch_inds].flatten()),
         )

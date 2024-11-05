@@ -22,10 +22,10 @@ from stable_baselines3.common.torch_layers import (
     CombinedExtractor,
     FlattenExtractor,
     MlpExtractor,
+    HybridActionMlpExtractor,
     NatureCNN,
 )
 from stable_baselines3.common.type_aliases import PyTorchObs, Schedule, TensorDict
-
 
 class HybridActorCriticPolicy(BasePolicy):
     """
@@ -60,24 +60,27 @@ class HybridActorCriticPolicy(BasePolicy):
     """
 
     def __init__(
-        self,
-        observation_space: spaces.Space,
-        action_space: spaces.Space,
-        lr_schedule: Schedule,
-        net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
-        activation_fn: Type[nn.Module] = nn.Tanh,
-        ortho_init: bool = True,
-        use_sde: bool = False,
-        log_std_init: float = 0.0,
-        full_std: bool = True,
-        use_expln: bool = False,
-        squash_output: bool = False,
-        features_extractor_class: Type[BaseFeaturesExtractor] = FlattenExtractor,
-        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
-        share_features_extractor: bool = True,
-        normalize_images: bool = True,
-        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
-        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+            self,
+            observation_space: spaces.Space,
+            action_space: spaces.Space,
+            lr_schedule: Schedule,
+            net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
+            activation_fn: Type[nn.Module] = nn.Tanh,
+            ortho_init: bool = True,
+            use_sde: bool = False,
+            log_std_init: float = 0.0,
+            full_std: bool = True,
+            use_expln: bool = False,
+            squash_output: bool = False,
+            features_extractor_class: Type[BaseFeaturesExtractor] = FlattenExtractor,
+            features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+            share_features_extractor: bool = True,
+            normalize_images: bool = True,
+            optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+            optimizer_kwargs: Optional[Dict[str, Any]] = None,
+            d_key: str = 'id',
+            c_key: str = 'parameters',
+            mask: Optional[np.ndarray] = None,
     ):
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
@@ -130,7 +133,8 @@ class HybridActorCriticPolicy(BasePolicy):
         self.log_std_init = log_std_init
         dist_kwargs = None
 
-        assert not (squash_output and not use_sde), "squash_output=True is only available when using gSDE (use_sde=True)"
+        assert not (
+                squash_output and not use_sde), "squash_output=True is only available when using gSDE (use_sde=True)"
         # Keyword arguments for gSDE distribution
         if use_sde:
             dist_kwargs = {
@@ -146,40 +150,31 @@ class HybridActorCriticPolicy(BasePolicy):
         # Action distribution
         # TODO: Two distributions for discrete and continuous actions
         assert isinstance(action_space, spaces.Dict)
-        # By default, parameterized action space is a Dictionart, and only have two items,
-        # one for action types, another for action parameters
-        self.d_key = None
-        self.c_key = None
+        self.d_key = d_key
+        self.c_key = c_key
+        self.mask = mask
         self.action_dist = {}
-        for key, subspace in action_space.spaces.items():
-            if isinstance(subspace, spaces.Discrete):
-                if self.d_key is not None:
-                    raise NotImplementedError("Parameterized action space should only have one discrete action space for action types.")
-                self.d_key = key
-            elif isinstance(subspace, spaces.Box):
-                if self.c_key is not None:
-                    raise NotImplementedError("Parameterized action space should only have one continuous action space for action parameters.")
-                self.c_key = key
-            else:
-                raise NotImplementedError(f"Unsupported action space '{subspace}'.")
-            self.action_dist[key] = make_proba_distribution(subspace, use_sde=use_sde, dist_kwargs=dist_kwargs)
+        self.action_dist[self.d_key] = make_proba_distribution(self.action_space[self.d_key], use_sde=use_sde,
+                                                               dist_kwargs=dist_kwargs)
+        self.action_dist[self.c_key] = make_proba_distribution(self.action_space[self.c_key], use_sde=use_sde,
+                                                               dist_kwargs=dist_kwargs)
         if self.d_key is None or self.c_key is None:
-            raise NotImplementedError("Parameterized action space should at least have one discrete action space for action types and one continuous action space for action parameters.")
+            raise NotImplementedError(
+                "Parameterized action space should at least have one discrete action space for action types and one continuous action space for action parameters.")
 
         self._build(lr_schedule)
 
-    @property
-    def d_key(self) -> str:
+    def get_d_key(self) -> str:
         return self.d_key
 
-    @property
-    def c_key(self) -> str:
-        return self.c_key 
+    def get_c_key(self) -> str:
+        return self.c_key
 
     def _get_constructor_parameters(self) -> Dict[str, Any]:
         data = super()._get_constructor_parameters()
 
-        default_none_kwargs = self.dist_kwargs or collections.defaultdict(lambda: None)  # type: ignore[arg-type, return-value]
+        default_none_kwargs = self.dist_kwargs or collections.defaultdict(
+            lambda: None)  # type: ignore[arg-type, return-value]
 
         data.update(
             dict(
@@ -200,18 +195,18 @@ class HybridActorCriticPolicy(BasePolicy):
         )
         return data
 
-    def reset_noise(self, n_envs: int = 1) -> None:
-        """
-        Sample new weights for the exploration matrix.
+    # def reset_noise(self, n_envs: int = 1) -> None:
+    #     """
+    #     Sample new weights for the exploration matrix.
 
-        :param n_envs:
-        """
-        assert isinstance(self.action_dist, StateDependentNoiseDistribution), "reset_noise() is only available when using gSDE"
-        self.action_dist.sample_weights(self.log_std, batch_size=n_envs)
+    #     :param n_envs:
+    #     """
+    #     assert isinstance(self.action_dist, StateDependentNoiseDistribution), "reset_noise() is only available when using gSDE"
+    #     self.action_dist.sample_weights(self.log_std, batch_size=n_envs)
 
     def _build_mlp_extractor(self) -> None:
         """
-        Create the policy and value networks.
+        Create the policy and value networks and the features extractor for discrete and continuous actions.
         Part of the layers can be shared.
         """
         # Note: If net_arch is None and some features extractor is used,
@@ -219,6 +214,13 @@ class HybridActorCriticPolicy(BasePolicy):
         #       really contain any layers (acts like an identity module).
         self.mlp_extractor = MlpExtractor(
             self.features_dim,
+            net_arch=self.net_arch,
+            activation_fn=self.activation_fn,
+            device=self.device,
+        )
+
+        self.action_features_extractor = HybridActionMlpExtractor(
+            self.mlp_extractor.latent_dim_pi,
             net_arch=self.net_arch,
             activation_fn=self.activation_fn,
             device=self.device,
@@ -233,23 +235,13 @@ class HybridActorCriticPolicy(BasePolicy):
         """
         self._build_mlp_extractor()
 
-        latent_dim_pi = self.mlp_extractor.latent_dim_pi
-        
+        last_dim_di = self.action_features_extractor.latent_dim_di
+        last_dim_co = self.action_features_extractor.latent_dim_co
+
         # TODO: create two types of action net
         self.action_net = {}
-        for key, action_dist in self.action_dist.items():
-            if isinstance(action_dist, DiagGaussianDistribution):
-                self.action_net[key], self.log_std = action_dist.proba_distribution_net(
-                    latent_dim=latent_dim_pi, log_std_init=self.log_std_init
-                )
-            elif isinstance(action_dist, StateDependentNoiseDistribution):
-                self.action_net[key], self.log_std = action_dist.proba_distribution_net(
-                    latent_dim=latent_dim_pi, latent_sde_dim=latent_dim_pi, log_std_init=self.log_std_init
-                )
-            elif isinstance(action_dist, (CategoricalDistribution, MultiCategoricalDistribution, BernoulliDistribution)):
-                self.action_net[key] = action_dist.proba_distribution_net(latent_dim=latent_dim_pi)
-            else:
-                raise NotImplementedError(f"Unsupported distribution '{self.action_dist}'.")
+        self.action_net[self.d_key] = self.action_dist[self.d_key].proba_distribution_net(latent_dim=last_dim_di)
+        self.action_net[self.c_key], self.log_std = self.action_dist[self.c_key].proba_distribution_net(latent_dim=last_dim_co, log_std_init=self.log_std_init)
 
         self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, 1)
         # Init weights: use orthogonal initialization
@@ -262,6 +254,7 @@ class HybridActorCriticPolicy(BasePolicy):
             module_gains = {
                 self.features_extractor: np.sqrt(2),
                 self.mlp_extractor: np.sqrt(2),
+                self.action_features_extractor: np.sqrt(2),     # TODO: check for action_features_extractor
                 self.action_net[self.d_key]: 0.01,
                 self.action_net[self.c_key]: 0.01,
                 self.value_net: 1,
@@ -277,7 +270,8 @@ class HybridActorCriticPolicy(BasePolicy):
                 module.apply(partial(self.init_weights, gain=gain))
 
         # Setup optimizer with initial learning rate
-        self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)  # type: ignore[call-arg]
+        self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1),
+                                              **self.optimizer_kwargs)  # type: ignore[call-arg]
 
     def forward(self, obs: PyTorchObs, deterministic: bool = False) -> Tuple[TensorDict, th.Tensor, TensorDict]:
         """
@@ -297,20 +291,26 @@ class HybridActorCriticPolicy(BasePolicy):
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         # Evaluate the values for the given observations
         values = self.value_net(latent_vf)
-        
+
         # TODO: Two types of distribution, and joint them
         actions = {}
         log_prob = {}
-        dictDistribution = self._get_action_dist_from_latent(latent_pi)
-        for key, distribution in dictDistribution.items():
-            actions[key] = distribution.get_actions(deterministic=deterministic)
-            log_prob[key] =  distribution.log_prob(actions[key])
-            actions[key] = actions[key].reshape((-1, *self.action_space.spaces[key].shape))  # type: ignore[misc]
+
+        dis_distribution = self._get_dis_action_dist_from_latent(latent_pi)
+        actions[self.d_key] = dis_distribution.get_actions(deterministic=deterministic)
+        log_prob[self.d_key] = dis_distribution.log_prob(actions[self.d_key])
+
+        con_distribution = self._get_con_action_dist_from_latent(latent_pi, actions[self.d_key])
+        actions[self.c_key] = con_distribution.get_actions(deterministic=deterministic)
+        log_prob[self.c_key] = con_distribution.log_prob(actions[self.c_key])
+
+        actions[self.d_key] = actions[self.d_key].reshape((-1, *self.action_space.spaces[self.d_key].shape))
+        actions[self.c_key] = actions[self.c_key].reshape((-1, *self.action_space.spaces[self.c_key].shape))
 
         return actions, values, log_prob
 
     def extract_features(  # type: ignore[override]
-        self, obs: PyTorchObs, features_extractor: Optional[BaseFeaturesExtractor] = None
+            self, obs: PyTorchObs, features_extractor: Optional[BaseFeaturesExtractor] = None
     ) -> Union[th.Tensor, Tuple[th.Tensor, th.Tensor]]:
         """
         Preprocess the observation if needed and extract features.
@@ -321,7 +321,8 @@ class HybridActorCriticPolicy(BasePolicy):
             features for the actor and the features for the critic.
         """
         if self.share_features_extractor:
-            return super().extract_features(obs, self.features_extractor if features_extractor is None else features_extractor)
+            return super().extract_features(obs,
+                                            self.features_extractor if features_extractor is None else features_extractor)
         else:
             if features_extractor is not None:
                 warnings.warn(
@@ -333,53 +334,58 @@ class HybridActorCriticPolicy(BasePolicy):
             vf_features = super().extract_features(obs, self.vf_features_extractor)
             return pi_features, vf_features
 
-    # TODO: Two types of distribution
-    def _get_action_dist_from_latent(self, latent_pi: th.Tensor) -> Dict[str, Distribution]:
+    def _get_dis_action_dist_from_latent(self, latent_pi: th.Tensor) -> Distribution:
         """
-        Retrieve action distribution given the latent codes.
+        Retrieve discrete action distribution given the latent codes.
 
         :param latent_pi: Latent code for the actor
-        :return: Action distribution
+        :return: Discrete action distribution
         """
-        dictDistribution = {}
-        for key, action_net in self.action_net.items():
-            mean_actions = action_net(latent_pi)
+        latent_di = self.action_features_extractor.forward_discrete(latent_pi) # add a independent feature extractor for discrete action
+        mean_actions = self.action_net[self.d_key](latent_di)
+        distribution = self.action_dist[self.d_key].proba_distribution(action_logits=mean_actions)
 
-            if isinstance(self.action_dist[key], DiagGaussianDistribution):
-                dictDistribution[key] = self.action_dist[key].proba_distribution(mean_actions, self.log_std)
-            elif isinstance(self.action_dist[key], CategoricalDistribution):
-                # Here mean_actions are the logits before the softmax
-                dictDistribution[key] = self.action_dist[key].proba_distribution(action_logits=mean_actions)
-            elif isinstance(self.action_dist[key], MultiCategoricalDistribution):
-                # Here mean_actions are the flattened logits
-                dictDistribution[key] = self.action_dist[key].proba_distribution(action_logits=mean_actions)
-            elif isinstance(self.action_dist[key], BernoulliDistribution):
-                # Here mean_actions are the logits (before rounding to get the binary actions)
-                dictDistribution[key] = self.action_dist[key].proba_distribution(action_logits=mean_actions)
-            elif isinstance(self.action_dist[key], StateDependentNoiseDistribution):
-                dictDistribution[key] = self.action_dist[key].proba_distribution(mean_actions, self.log_std, latent_pi)
-            else:
-                raise ValueError("Invalid action distribution")
-        
-        return dictDistribution
-    
+        return distribution
+
+    def _get_con_action_dist_from_latent(self, latent_pi: th.Tensor, action_type: th.Tensor) -> Distribution:
+        """
+        Retrieve continuous action distribution given the latent codes.
+
+        :param latent_pi: Latent code for the actor
+        :param action_type: Discrete action
+        :return: Continuous action distribution
+        """
+        latent_co = self.action_features_extractor.forward_continuous(latent_pi) # add a independent feature extractor for continuous action
+        mean_actions = self.action_net[self.c_key](latent_co)
+
+        with th.no_grad():
+            mask_tensor = self.mask[action_type]
+
+        # covert to tensor
+        mask_tensor = th.tensor(mask_tensor, device=mean_actions.device, dtype=mean_actions.dtype)
+
+        masked_mean_actions = mean_actions * mask_tensor
+        masked_log_std = self.log_std * mask_tensor
+
+        distribution = self.action_dist[self.c_key].proba_distribution(masked_mean_actions, masked_log_std)
+
+        return distribution
+
     # TODO: predict discrete action and its' parameters respectively, and joint them
     def _predict(self, observation: PyTorchObs, deterministic: bool = False) -> TensorDict:
         """
         Get the action according to the policy for a given observation.
+        This is used for evaluation.
 
         :param observation:
         :param deterministic: Whether to use stochastic or deterministic actions
         :return: Taken action according to the policy
         """
-        actions = {}
-        dictDistribution = self.get_distribution(observation)
-        for key, distribution in dictDistribution.items():
-            actions[key] = distribution.get_actions(deterministic=deterministic)
-        return actions
+        return self.get_action(observation, deterministic)
 
     # TODO: evaluate discrete action and its' parameters respectively
-    def evaluate_actions(self, obs: PyTorchObs, actions: TensorDict) -> Tuple[th.Tensor, TensorDict, Optional[TensorDict]]:
+    def evaluate_actions(self, obs: PyTorchObs, actions: TensorDict) -> Tuple[
+        th.Tensor, TensorDict, Optional[TensorDict]]:
         """
         Evaluate actions according to the current policy,
         given the observations.
@@ -397,18 +403,24 @@ class HybridActorCriticPolicy(BasePolicy):
             pi_features, vf_features = features
             latent_pi = self.mlp_extractor.forward_actor(pi_features)
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
-        dictDistribution = self._get_action_dist_from_latent(latent_pi)
-        
+
+        values = self.value_net(latent_vf)
+
         log_prob = {}
         entropy = {}
-        for key, distribution in dictDistribution.items():
-            log_prob[key] = distribution.log_prob(actions[key])
-            values = self.value_net(latent_vf)
-            entropy[key] = distribution.entropy()
+
+        dis_distribution = self._get_dis_action_dist_from_latent(latent_pi)
+        log_prob[self.d_key] = dis_distribution.log_prob(actions[self.d_key])
+        entropy[self.d_key] = dis_distribution.entropy()
+
+        con_distribution = self._get_con_action_dist_from_latent(latent_pi, actions[self.d_key])
+        log_prob[self.c_key] = con_distribution.log_prob(actions[self.c_key])
+        entropy[self.c_key] = con_distribution.entropy()
+
         return values, log_prob, entropy
 
     # TODO: return two types of distribution
-    def get_distribution(self, obs: PyTorchObs) -> Dict[str, Distribution]:
+    def get_action(self, obs: PyTorchObs, deterministic) -> TensorDict:
         """
         Get the current policy distribution given the observations.
 
@@ -417,7 +429,14 @@ class HybridActorCriticPolicy(BasePolicy):
         """
         features = super().extract_features(obs, self.pi_features_extractor)
         latent_pi = self.mlp_extractor.forward_actor(features)
-        return self._get_action_dist_from_latent(latent_pi)
+
+        actions = {}
+        dis_distribution = self._get_dis_action_dist_from_latent(latent_pi)
+        actions[self.d_key] = dis_distribution.get_actions(deterministic=deterministic)
+        con_distribution = self._get_con_action_dist_from_latent(latent_pi, actions[self.d_key])
+        actions[self.c_key] = con_distribution.get_actions(deterministic=deterministic)
+
+        return actions
 
     def predict_values(self, obs: PyTorchObs) -> th.Tensor:
         """
@@ -464,24 +483,24 @@ class HybridActorCriticCnnPolicy(HybridActorCriticPolicy):
     """
 
     def __init__(
-        self,
-        observation_space: spaces.Space,
-        action_space: spaces.Space,
-        lr_schedule: Schedule,
-        net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
-        activation_fn: Type[nn.Module] = nn.Tanh,
-        ortho_init: bool = True,
-        use_sde: bool = False,
-        log_std_init: float = 0.0,
-        full_std: bool = True,
-        use_expln: bool = False,
-        squash_output: bool = False,
-        features_extractor_class: Type[BaseFeaturesExtractor] = NatureCNN,
-        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
-        share_features_extractor: bool = True,
-        normalize_images: bool = True,
-        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
-        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+            self,
+            observation_space: spaces.Space,
+            action_space: spaces.Space,
+            lr_schedule: Schedule,
+            net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
+            activation_fn: Type[nn.Module] = nn.Tanh,
+            ortho_init: bool = True,
+            use_sde: bool = False,
+            log_std_init: float = 0.0,
+            full_std: bool = True,
+            use_expln: bool = False,
+            squash_output: bool = False,
+            features_extractor_class: Type[BaseFeaturesExtractor] = NatureCNN,
+            features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+            share_features_extractor: bool = True,
+            normalize_images: bool = True,
+            optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+            optimizer_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             observation_space,
@@ -537,24 +556,24 @@ class MultiInputHybridActorCriticPolicy(HybridActorCriticPolicy):
     """
 
     def __init__(
-        self,
-        observation_space: spaces.Dict,
-        action_space: spaces.Space,
-        lr_schedule: Schedule,
-        net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
-        activation_fn: Type[nn.Module] = nn.Tanh,
-        ortho_init: bool = True,
-        use_sde: bool = False,
-        log_std_init: float = 0.0,
-        full_std: bool = True,
-        use_expln: bool = False,
-        squash_output: bool = False,
-        features_extractor_class: Type[BaseFeaturesExtractor] = CombinedExtractor,
-        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
-        share_features_extractor: bool = True,
-        normalize_images: bool = True,
-        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
-        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+            self,
+            observation_space: spaces.Dict,
+            action_space: spaces.Space,
+            lr_schedule: Schedule,
+            net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
+            activation_fn: Type[nn.Module] = nn.Tanh,
+            ortho_init: bool = True,
+            use_sde: bool = False,
+            log_std_init: float = 0.0,
+            full_std: bool = True,
+            use_expln: bool = False,
+            squash_output: bool = False,
+            features_extractor_class: Type[BaseFeaturesExtractor] = CombinedExtractor,
+            features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+            share_features_extractor: bool = True,
+            normalize_images: bool = True,
+            optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+            optimizer_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             observation_space,
