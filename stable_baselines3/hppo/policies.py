@@ -1,3 +1,4 @@
+import collections
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 from functools import partial
 import warnings
@@ -79,7 +80,7 @@ class HybridActorCriticPolicy(BasePolicy):
             optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
             optimizer_kwargs: Optional[Dict[str, Any]] = None,
             d_key: str = 'id',
-            c_key: str = 'parameters',
+            c_key: str = 'params',
             mask: Optional[np.ndarray] = None,
     ):
         if optimizer_kwargs is None:
@@ -242,6 +243,7 @@ class HybridActorCriticPolicy(BasePolicy):
         self.action_net = {}
         self.action_net[self.d_key] = self.action_dist[self.d_key].proba_distribution_net(latent_dim=last_dim_di)
         self.action_net[self.c_key], self.log_std = self.action_dist[self.c_key].proba_distribution_net(latent_dim=last_dim_co, log_std_init=self.log_std_init)
+        self.action_net = nn.ModuleDict(self.action_net)
 
         self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, 1)
         # Init weights: use orthogonal initialization
@@ -359,7 +361,8 @@ class HybridActorCriticPolicy(BasePolicy):
         mean_actions = self.action_net[self.c_key](latent_co)
 
         with th.no_grad():
-            mask_tensor = self.mask[action_type]
+            action_type_np = action_type.cpu().numpy()
+            mask_tensor = self.mask[action_type_np]
 
         # covert to tensor
         mask_tensor = th.tensor(mask_tensor, device=mean_actions.device, dtype=mean_actions.dtype)
@@ -501,6 +504,9 @@ class HybridActorCriticCnnPolicy(HybridActorCriticPolicy):
             normalize_images: bool = True,
             optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
             optimizer_kwargs: Optional[Dict[str, Any]] = None,
+            d_key: str = 'id',
+            c_key: str = 'params',
+            mask: Optional[np.ndarray] = None,
     ):
         super().__init__(
             observation_space,
@@ -520,6 +526,9 @@ class HybridActorCriticCnnPolicy(HybridActorCriticPolicy):
             normalize_images,
             optimizer_class,
             optimizer_kwargs,
+            d_key,
+            c_key,
+            mask,
         )
 
 
@@ -574,6 +583,9 @@ class MultiInputHybridActorCriticPolicy(HybridActorCriticPolicy):
             normalize_images: bool = True,
             optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
             optimizer_kwargs: Optional[Dict[str, Any]] = None,
+            d_key: str = 'id',
+            c_key: str = 'params',
+            mask: Optional[np.ndarray] = None,
     ):
         super().__init__(
             observation_space,
@@ -593,6 +605,9 @@ class MultiInputHybridActorCriticPolicy(HybridActorCriticPolicy):
             normalize_images,
             optimizer_class,
             optimizer_kwargs,
+            d_key,
+            c_key,
+            mask,
         )
 
 

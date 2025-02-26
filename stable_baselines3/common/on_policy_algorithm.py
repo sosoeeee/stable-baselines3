@@ -117,7 +117,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         self.ent_coef = get_schedule_fn(self.ent_coef)
         self.set_random_seed(self.seed)
 
-        # TODO: when self.action_space is Dice, use DictRolloutBuffer also
+        # TODO: when self.action_space is Dict, use DictRolloutBuffer also
         if self.rollout_buffer_class is None:
             if isinstance(self.observation_space, spaces.Dict):
                 if isinstance(self.action_space, spaces.Dict):

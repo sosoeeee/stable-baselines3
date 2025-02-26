@@ -582,10 +582,13 @@ def reorgnize_action_space(action_space: spaces.Dict):
     parameters_min = []
     parameters_max = []
     idx = [0]
+    c_key = None
     for key, space in action_space.spaces.items():
         if isinstance(space, spaces.Discrete):
             d_key = key
         else:
+            if c_key is None:
+                c_key = re.split(r'(\d+)', key)[0]
             parameters_min.append(space.low)
             parameters_max.append(space.high)
             idx.append(len(space.low) + idx[-1])
@@ -597,7 +600,10 @@ def reorgnize_action_space(action_space: spaces.Dict):
     for i in range(len(idx) - 1):
         mask[i, idx[i]:idx[i + 1]] = 1
 
-    c_key = "parameters"
+    print(f"parameters_min: {parameters_min}, parameters_max: {parameters_max}, parameters_num: {parameters_num}, mask: {mask}")
+
+    # c_key = "parameters"
+    # c_key = PARAMETER_KEY_SB3       # aviod the conflict with the key "parameters" in the model
 
     # Generate the new action space
     action_space = spaces.Dict({
@@ -631,9 +637,9 @@ def separate_action(action: Optional[Union[Dict, List[Dict]]] = None,
 
     if isinstance(action, dict):
         type_ = action[TYPE_KEY]
-        paras_ = action["parameters"][PARAMETER_INDEX[type_]:PARAMETER_INDEX[type_ + 1]]
-        return {TYPE_KEY: type_, PARAMETER_KEY+str(a[TYPE_KEY]): paras_}
+        paras_ = action[PARAMETER_KEY][PARAMETER_INDEX[type_]:PARAMETER_INDEX[type_ + 1]]
+        return {TYPE_KEY: type_, PARAMETER_KEY+str(TYPE_KEY): paras_}
     else:
         return [{TYPE_KEY: a[TYPE_KEY],
-                 PARAMETER_KEY+str(a[TYPE_KEY]): a["parameters"][PARAMETER_INDEX[a[TYPE_KEY]]:PARAMETER_INDEX[a[TYPE_KEY] + 1]]} for a in
+                 PARAMETER_KEY+str(a[TYPE_KEY]): a[PARAMETER_KEY][PARAMETER_INDEX[a[TYPE_KEY]]:PARAMETER_INDEX[a[TYPE_KEY] + 1]]} for a in
                 action]
