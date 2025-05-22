@@ -374,12 +374,12 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             iteration += 1
             self._update_current_progress_remaining(self.num_timesteps, total_timesteps)
 
+            self.train() # train before logging
+
             # Display training infos
             if log_interval is not None and iteration % log_interval == 0:
                 assert self.ep_info_buffer is not None
                 self._dump_logs(iteration)
-
-            self.train()
 
         callback.on_training_end()
 

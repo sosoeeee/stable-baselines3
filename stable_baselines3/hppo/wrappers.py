@@ -45,7 +45,7 @@ class RescaleActionWrapper(gym.ActionWrapper, gym.utils.RecordConstructorArgs):
             max_action (float, int or np.ndarray): The max values for each action. This may be a numpy array or a scalar.
         """
         assert isinstance(env.action_space, Box) or isinstance(env.action_space, Dict), f"expected Box or Dict action space, got {type(env.action_space)}"
-        assert np.less_equal(min_action, max_action).all(), (min_action, max_action)
+        assert np.less_equal(min_action, max_action).all(), f"expected min_action <= max_action, got min_action={min_action}, max_action={max_action}"
 
         gym.utils.RecordConstructorArgs.__init__(
             self, min_action=min_action, max_action=max_action
@@ -86,6 +86,8 @@ class RescaleActionWrapper(gym.ActionWrapper, gym.utils.RecordConstructorArgs):
                         shape=env.action_space.spaces[key].shape,
                         dtype=env.action_space.spaces[key].dtype,
                     )
+
+        print("====================== RescaleActionWrapper: {}, {} =======================".format(min_action, max_action))
 
     def action(self, action):
         """Rescales the action affinely from  [:attr:`min_action`, :attr:`max_action`] to the action space of the base environment, :attr:`env`.

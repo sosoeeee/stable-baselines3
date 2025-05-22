@@ -1,5 +1,5 @@
 import collections
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type, Union
 from functools import partial
 import warnings
 
@@ -118,7 +118,13 @@ class HybridActorCriticPolicy(BasePolicy):
                 net_arch = dict(pi=[64, 64], vf=[64, 64])
 
         self.net_arch = net_arch
-        self.activation_fn = activation_fn
+        activation_fn_by_name = {
+            "tanh": nn.Tanh,
+            "relu": nn.ReLU,
+            "elu": nn.ELU,
+            "leaky_relu": nn.LeakyReLU
+        }
+        self.activation_fn = activation_fn_by_name[activation_fn] if isinstance(activation_fn, str) else activation_fn
         self.ortho_init = ortho_init
 
         self.share_features_extractor = share_features_extractor
