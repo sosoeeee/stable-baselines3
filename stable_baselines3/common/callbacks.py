@@ -412,6 +412,10 @@ class EvalCallback(EventCallback):
         self._is_success_buffer: List[bool] = []
         self.evaluations_successes: List[List[bool]] = []
 
+        # For computing the replan freq
+        self._replan_freq_buffer: List[float] = []
+        self.evaluations_replan_freq: List[List[float]] = []
+
     def _init_callback(self) -> None:
         # Does not work in some corner cases, where the wrapper is not the same
         if not isinstance(self.training_env, type(self.eval_env)):
@@ -440,8 +444,11 @@ class EvalCallback(EventCallback):
 
         if locals_["done"]:
             maybe_is_success = info.get("is_success")
+            replan_freq = info.get("replan_freq")
             if maybe_is_success is not None:
                 self._is_success_buffer.append(maybe_is_success)
+            if replan_freq is not None:
+                self._replan_freq_buffer.append(replan_freq)
 
     def _on_step(self) -> bool:
         continue_training = True
@@ -460,6 +467,7 @@ class EvalCallback(EventCallback):
 
             # Reset success rate buffer
             self._is_success_buffer = []
+            self._replan_freq_buffer = []
 
             episode_rewards, episode_lengths = evaluate_policy(
                 self.model,
@@ -484,14 +492,26 @@ class EvalCallback(EventCallback):
                 if len(self._is_success_buffer) > 0:
                     self.evaluations_successes.append(self._is_success_buffer)
                     kwargs = dict(successes=self.evaluations_successes)
+                
+                if len(self._replan_freq_buffer) > 0:
+                    self.evaluations_replan_freq.append(self._replan_freq_buffer)
+                    kwargs.update(replan_freq=self.evaluations_replan_freq)
 
-                np.savez(
-                    self.log_path,
-                    timesteps=self.evaluations_timesteps,
-                    results=self.evaluations_results,
-                    ep_lengths=self.evaluations_length,
-                    **kwargs,
-                )
+                try:
+                    np.savez(
+                        self.log_path,
+                        timesteps=self.evaluations_timesteps,
+                        results=self.evaluations_results,
+                        ep_lengths=self.evaluations_length,
+                        **kwargs,
+                    )
+                except Exception as e:
+                    print(f"Error saving data: {e}")
+                    print(f"Timesteps shape: {np.shape(self.evaluations_timesteps)}")
+                    print(f"Results shape: {np.shape(self.evaluations_results)}")
+                    print(f"EP lengths shape: {np.shape(self.evaluations_length)}")
+                    print(f"kwargs: {kwargs}")
+                    exit(1)
 
             mean_reward, std_reward = np.mean(episode_rewards), np.std(episode_rewards)
             mean_ep_length, std_ep_length = np.mean(episode_lengths), np.std(episode_lengths)
@@ -509,6 +529,12 @@ class EvalCallback(EventCallback):
                 if self.verbose >= 1:
                     print(f"Success rate: {100 * success_rate:.2f}%")
                 self.logger.record("eval/success_rate", success_rate)
+            
+            if len(self._replan_freq_buffer) > 0:
+                replan_freq = np.mean(self._replan_freq_buffer)
+                if self.verbose >= 1:
+                    print(f"Replan frequency: {replan_freq:.2f}")
+                self.logger.record("eval/replan_freq", replan_freq)
 
             # Dump log so the evaluation results are printed with the correct timestep
             self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
