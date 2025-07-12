@@ -13,6 +13,9 @@ from stable_baselines3.hppo.policies import HybridActorCriticPolicy, HybridActor
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import explained_variance, get_schedule_fn, reorgnize_action_space, separate_action
 
+# debug
+import copy
+
 # TODO: change to HPPO
 SelfHPPO = TypeVar("SelfHPPO", bound="HPPO")
 
@@ -307,6 +310,25 @@ class HPPO(OnPolicyAlgorithm):
                 break
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
+
+        # debug --- check the explored action in the rollout buffer
+        if self.num_timesteps % (self.rollout_buffer.buffer_size * 5) == 0:
+            con_radius_filter = copy.deepcopy(self.rollout_buffer.actions[c_key][:, 1].flatten())
+            con_depth_filter = copy.deepcopy(self.rollout_buffer.actions[c_key][:, 0].flatten())
+            for i in range(np.shape(self.rollout_buffer.actions[c_key])[0]):
+                if self.rollout_buffer.actions[d_key][i, 0] == 0.0:
+                    # set con_action_filter[i] to invalid value
+                    con_radius_filter[i] = None
+                    con_depth_filter[i] = None
+            
+            # 过滤掉 None 值
+            valid_radius = con_radius_filter[~np.isnan(con_radius_filter)]
+            valid_depth = con_depth_filter[~np.isnan(con_depth_filter)]
+
+            self.logger.record("train/explored_radius", valid_radius)
+            self.logger.record("train/explored_depth", valid_depth)
+            self.logger.record("train/replan_proportion", len(valid_radius) / self.rollout_buffer.buffer_size)
+            # self.logger.record("train/explored_radius", self.rollout_buffer.actions[c_key][:, 1].flatten())
 
         # Logs
         self.logger.record("train/d_entropy_loss", np.mean(d_entropy_losses))
