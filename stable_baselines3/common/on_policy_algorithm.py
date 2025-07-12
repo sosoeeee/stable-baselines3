@@ -203,6 +203,75 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                 # Sample a new noise matrix
                 self.policy.reset_noise(env.num_envs)
 
+            # ======= safety filter to increase the exploration efficiency =======
+            # with th.no_grad():
+            #     # Convert to pytorch tensor or to TensorDict
+            #     obs_tensor = obs_as_tensor(self._last_obs, self.device)
+            #     actions, values, log_probs = self.policy(obs_tensor)
+              
+            # # Convert tensor to numpy, and reshape to the original action shape
+            # if isinstance(self.action_space, spaces.Dict):
+            #     for key, act in actions.items():
+            #         actions[key] = act.cpu().numpy().reshape((-1, *self.action_space.spaces[key].shape))
+            # else:
+            #     actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))  # type: ignore[misc, assignment]
+
+            # # print("actions: ", actions)
+            # # print("values: ", values)
+            # # print("log_probs: ", log_probs)
+
+            # # Check which actions are valid (implement this function based on your environment)
+            # valid_mask, actions_refactor = self._check_action_validity(env, actions)  # Returns boolean array of shape [num_envs]
+
+            # # Resample actions for invalid environments
+            # while not np.all(valid_mask):
+            #     # Get indices of environments with invalid actions
+            #     invalid_indices = np.where(~valid_mask)[0]
+                
+            #     # Create a sub-observation dictionary for just those environments
+            #     invalid_obs = {}
+            #     for key, tensor in obs_tensor.items():
+            #         invalid_obs[key] = tensor[invalid_indices]
+                
+            #     # Resample actions just for those environments
+            #     with th.no_grad():
+            #         new_actions, new_values, new_log_probs = self.policy(invalid_obs)
+
+            #     # Convert to numpy 
+            #     if isinstance(self.action_space, spaces.Dict):
+            #         for key, act in new_actions.items():
+            #             new_actions[key] = act.cpu().numpy().reshape((-1, *self.action_space.spaces[key].shape))
+            #     else:
+            #         new_actions = new_actions.cpu().numpy().reshape((-1, *self.action_space.shape))  # type: ignore[misc, assignment]
+
+            #     # print(f"Invalid obs: {invalid_obs}")
+            #     # print(f"New actions: {new_actions}")
+            #     # print(f"New values: {new_values}")
+            #     # print(f"New log_probs: {new_log_probs}")
+                
+            #     # Replace the invalid actions with the new ones
+            #     if isinstance(self.action_space, spaces.Dict):
+            #         for i, idx in enumerate(invalid_indices):
+            #             values[idx] = new_values[i]
+            #             for key in actions.keys():
+            #                 actions[key][idx] = new_actions[key][i]
+            #                 log_probs[key][idx] = new_log_probs[key][i]
+            #     else:
+            #         for i, idx in enumerate(invalid_indices):
+            #             actions[idx] = new_actions[i]
+            #             values[idx] = new_values[i]
+            #             log_probs[idx] = new_log_probs[i]
+                
+            #     # Recheck validity
+            #     valid_mask, actions_refactor = self._check_action_validity(env, actions)
+            
+            # print(f"================= STEP actions =================: {actions_refactor}")
+            # print("")
+
+            # new_obs, rewards, dones, infos = env.step(actions_refactor)
+
+            # ====================================================================
+            
             with th.no_grad():
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
@@ -243,7 +312,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                     if isinstance(self.action_space.spaces[key], spaces.Box):
                         if self.policy.squash_output:
                             # Rescale to proper domain when using squashing
-                            clipped_actions[key] = self.unscale_action(act)  # type: ignore[assignment, arg-type]
+                            clipped_actions[key] = self.policy.unscale_action(act)  # type: ignore[assignment, arg-type]
                         else:
                             # Actions could be on arbitrary scale, so clip the actions to avoid
                             # out of bound error (e.g. if sampling from a Gaussian distribution)
@@ -389,3 +458,90 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         state_dicts = ["policy", "policy.optimizer"]
 
         return state_dicts, []
+
+    # def _check_action_validity(self, env, actions_np):
+    #     # print(f"================= _check_action_validity actions_np ===========: {actions_np}")
+
+    #     if isinstance(self.action_space, spaces.Dict):
+    #         valid_mask = np.ones(actions_np[next(iter(actions_np))].shape[0], dtype=bool) # get the first key
+    #     else:
+    #         valid_mask = np.ones(actions_np.shape[0], dtype=bool)
+
+    #     # check if in the valid range
+    #     if isinstance(self.action_space, spaces.Box):
+    #         if self.policy.squash_output:
+    #             # Unscale the actions to match env bounds
+    #             # if they were previously squashed (scaled in [-1, 1])
+    #             actions_np = self.policy.unscale_action(actions_np)
+    #         else:
+    #             # Otherwise, clip the actions to avoid out of bound error
+    #             # as we are sampling from an unbounded Gaussian distribution
+    #             for i in range(actions_np.shape[0]):
+    #                 valid_mask[i] = np.all(np.logical_and(actions_np[i] >= self.action_space.low, actions_np[i] <= self.action_space.high))
+                    
+    #                 # debug print invalid actions
+    #                 # if not valid_mask[i]:
+    #                 #     print(f"Invalid action at index {i}: {actions_np[i]}")
+    #                 #     print(f"Action space low: {self.action_space.low}")
+    #                 #     print(f"Action space high: {self.action_space.high}")
+                    
+    #             # clip for environment check
+    #             actions_np = np.clip(actions_np, self.action_space.low, self.action_space.high)
+                
+    #     elif isinstance(self.action_space, spaces.Dict):
+    #         for key, act in actions_np.items():
+    #             if isinstance(self.action_space.spaces[key], spaces.Box):
+    #                 if self.policy.squash_output:
+    #                     # Rescale to proper domain when using squashing
+    #                     actions_np[key] = self.policy.unscale_action(act)  # type: ignore[assignment, arg-type]
+    #                 else:
+    #                     # Actions could be on arbitrary scale, so clip the actions to avoid
+    #                     # out of bound error (e.g. if sampling from a Gaussian distribution)
+    #                     for i in range(actions_np[key].shape[0]):
+    #                         # special case for parameterized action space (skip the action with id=0)
+    #                         if actions_np['id'][i] != 0 and valid_mask[i]:
+    #                             valid_mask[i] = np.all(np.logical_and(actions_np[key][i] >= self.action_space.spaces[key].low, actions_np[key][i] <= self.action_space.spaces[key].high))
+                            
+    #                         # debug print invalid actions
+    #                         # if not valid_mask[i]:
+    #                         #     print(f"Invalid action at index {i}: {actions_np[key][i]}")
+    #                         #     print(f"Action space low: {self.action_space.spaces[key].low}")
+    #                         #     print(f"Action space high: {self.action_space.spaces[key].high}")
+
+    #                     # clip for environment check
+    #                     actions_np[key] = np.clip(act, self.action_space.spaces[key].low, self.action_space.spaces[key].high)
+
+
+    #     # check if invalid when interacting with the environment
+    #     if isinstance(self.action_space, spaces.Dict):
+    #         actions_np = [{key: actions_np[key][i] for key in actions_np} for i in range(len(next(iter(actions_np.values()))))]
+    #         # separate the action on parameters dimension
+    #         actions_refactor = separate_action(action=actions_np)
+        
+    #     # Use env_method instead of direct attribute call
+    #     try:
+    #         # For vectorized environments
+    #         env_valid_mask = env.env_method_per_env("check_action_validity", actions_refactor)
+    #         # Convert from list of results (one per env) to numpy array
+    #         env_valid_mask = np.array(env_valid_mask)
+    #     except AttributeError:
+    #         # Fallback for non-vectorized environments
+    #         env_valid_mask = env.env_method("check_action_validity", actions_refactor)
+
+    #     # combine the two masks
+    #     for i in range(len(valid_mask)):
+    #         valid_mask[i] = valid_mask[i] and env_valid_mask[i]
+
+    #     # DEBUG print invalid actions
+    #     if not np.all(valid_mask):
+    #         # Convert mask to numpy boolean array if it isn't already
+    #         valid_mask_bool = np.array(valid_mask, dtype=bool)
+    #         invalid_indices = np.where(~valid_mask_bool)[0]
+    #         # print(f"Invalid action indices: {invalid_indices}")
+    #         print(f"Invalid actions:")
+    #         for idx in invalid_indices:
+    #             print(f"  At index {idx}: {actions_refactor[idx]}")
+    #         print(f"Valid mask: {valid_mask}")
+    #         print("")
+        
+    #     return valid_mask, actions_refactor
