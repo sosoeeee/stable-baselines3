@@ -416,6 +416,10 @@ class EvalCallback(EventCallback):
         self._replan_freq_buffer: List[float] = []
         self.evaluations_replan_freq: List[List[float]] = []
 
+        # For computing the fail rate
+        self._fail_rate_buffer: List[float] = []
+        self.evaluations_fail_rate: List[List[float]] = []
+
     def _init_callback(self) -> None:
         # Does not work in some corner cases, where the wrapper is not the same
         if not isinstance(self.training_env, type(self.eval_env)):
@@ -445,10 +449,13 @@ class EvalCallback(EventCallback):
         if locals_["done"]:
             maybe_is_success = info.get("is_success")
             replan_freq = info.get("replan_freq")
+            fail_rate = info.get("fail_rate")
             if maybe_is_success is not None:
                 self._is_success_buffer.append(maybe_is_success)
             if replan_freq is not None:
                 self._replan_freq_buffer.append(replan_freq)
+            if fail_rate is not None:
+                self._fail_rate_buffer.append(fail_rate)
 
     def _on_step(self) -> bool:
         continue_training = True
@@ -468,6 +475,7 @@ class EvalCallback(EventCallback):
             # Reset success rate buffer
             self._is_success_buffer = []
             self._replan_freq_buffer = []
+            self._fail_rate_buffer = []
 
             episode_rewards, episode_lengths = evaluate_policy(
                 self.model,
@@ -496,6 +504,10 @@ class EvalCallback(EventCallback):
                 if len(self._replan_freq_buffer) > 0:
                     self.evaluations_replan_freq.append(self._replan_freq_buffer)
                     kwargs.update(replan_freq=self.evaluations_replan_freq)
+                
+                if len(self._fail_rate_buffer) > 0:
+                    self.evaluations_fail_rate.append(self._fail_rate_buffer)
+                    kwargs.update(fail_rate=self.evaluations_fail_rate)
 
                 try:
                     np.savez(
@@ -535,6 +547,12 @@ class EvalCallback(EventCallback):
                 if self.verbose >= 1:
                     print(f"Replan frequency: {replan_freq:.2f}")
                 self.logger.record("eval/replan_freq", replan_freq)
+            
+            if len(self._fail_rate_buffer) > 0:
+                fail_rate = np.mean(self._fail_rate_buffer)
+                if self.verbose >= 1:
+                    print(f"Fail rate: {fail_rate:.2f}")
+                self.logger.record("eval/fail_rate", fail_rate)
 
             # Dump log so the evaluation results are printed with the correct timestep
             self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
