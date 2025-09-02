@@ -420,6 +420,10 @@ class EvalCallback(EventCallback):
         self._fail_rate_buffer: List[float] = []
         self.evaluations_fail_rate: List[List[float]] = []
 
+        # For computing the average angle
+        self._angle_buffer: List[float] = []
+        self.evaluations_angle: List[List[float]] = []
+
     def _init_callback(self) -> None:
         # Does not work in some corner cases, where the wrapper is not the same
         if not isinstance(self.training_env, type(self.eval_env)):
@@ -450,12 +454,15 @@ class EvalCallback(EventCallback):
             maybe_is_success = info.get("is_success")
             replan_freq = info.get("replan_freq")
             fail_rate = info.get("fail_rate")
+            avr_angle = info.get("avr_angle")
             if maybe_is_success is not None:
                 self._is_success_buffer.append(maybe_is_success)
             if replan_freq is not None:
                 self._replan_freq_buffer.append(replan_freq)
             if fail_rate is not None:
                 self._fail_rate_buffer.append(fail_rate)
+            if avr_angle is not None:
+                self._angle_buffer.append(avr_angle)
 
     def _on_step(self) -> bool:
         continue_training = True
@@ -476,6 +483,7 @@ class EvalCallback(EventCallback):
             self._is_success_buffer = []
             self._replan_freq_buffer = []
             self._fail_rate_buffer = []
+            self._angle_buffer = []
 
             episode_rewards, episode_lengths = evaluate_policy(
                 self.model,
@@ -508,6 +516,10 @@ class EvalCallback(EventCallback):
                 if len(self._fail_rate_buffer) > 0:
                     self.evaluations_fail_rate.append(self._fail_rate_buffer)
                     kwargs.update(fail_rate=self.evaluations_fail_rate)
+                
+                if len(self._angle_buffer) > 0:
+                    self.evaluations_angle.append(self._angle_buffer)
+                    kwargs.update(avr_angle=self.evaluations_angle)
 
                 try:
                     np.savez(
@@ -553,6 +565,12 @@ class EvalCallback(EventCallback):
                 if self.verbose >= 1:
                     print(f"Fail rate: {fail_rate:.2f}")
                 self.logger.record("eval/fail_rate", fail_rate)
+
+            if len(self._angle_buffer) > 0:
+                avr_angle = np.mean(self._angle_buffer)
+                if self.verbose >= 1:
+                    print(f"Average angle: {avr_angle:.2f}")
+                self.logger.record("eval/avr_angle", avr_angle)
 
             # Dump log so the evaluation results are printed with the correct timestep
             self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
