@@ -1,5 +1,6 @@
 import warnings
-from typing import Any, ClassVar, Dict, Optional, Type, TypeVar, Union
+import re
+from typing import Any, ClassVar, Dict, List, Optional, Type, TypeVar, Union
 
 import numpy as np
 import torch as th
@@ -11,7 +12,7 @@ from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 # TODO: change policy networks
 from stable_baselines3.hppo.policies import HybridActorCriticPolicy, HybridActorCriticCnnPolicy, MultiInputHybridActorCriticPolicy, BasePolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import explained_variance, get_schedule_fn, reorgnize_action_space, separate_action
+from stable_baselines3.common.utils import explained_variance, get_schedule_fn
 
 # debug
 import copy
@@ -139,8 +140,8 @@ class HPPO(OnPolicyAlgorithm):
         )
 
         # store the original action space info
-        _ = separate_action(action=None, original_action_space=self.action_space)
-        self.action_space, d_key, c_key, mask = reorgnize_action_space(self.action_space)
+        self.original_action_space = self.action_space
+        self.action_space, d_key, c_key, mask = self._reorgnize_action_space(self.original_action_space)
         self.policy_kwargs = policy_kwargs or {}
         self.policy_kwargs.update({"d_key": d_key, "c_key": c_key, "mask": mask})
 
@@ -181,6 +182,10 @@ class HPPO(OnPolicyAlgorithm):
 
     def _setup_model(self) -> None:
         super()._setup_model()
+
+        # Initialize the policy's action restoration with the original action space
+        if hasattr(self.policy, 'restore_action'):
+            self.policy.restore_action(action=None, original_action_space=self.original_action_space)
 
         # Initialize schedules for policy/value clipping
         self.clip_range = get_schedule_fn(self.clip_range)
@@ -348,6 +353,58 @@ class HPPO(OnPolicyAlgorithm):
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
+
+    @staticmethod
+    def _reorgnize_action_space(action_space: spaces.Dict):
+        """
+        Reorganize the action space to make it compatible with the model.
+        The parameters are concatenated into a single space.
+        And generate a mask matrix to separate the parameters.
+
+        By default, parameterized action space is a Dictionary, and has one key for action types
+        and n keys for action parameters, where n is the number of action types.
+        ==================================== like ====================================
+        action_space = spaces.Dict({
+            "action_type": spaces.Discrete(2),
+            "action_param0": spaces.Box(low=-1, high=1, shape=(1,)),
+            "action_param1": spaces.Box(low=-1, high=1, shape=(1,))
+        })
+        ==============================================================================
+        this function reorganizes the action space to two keys, one for action types and one for all action parameters
+        """
+        assert isinstance(action_space, spaces.Dict), "The action space must be a Dict space."
+
+        # Get the action type
+        parameters_min = []
+        parameters_max = []
+        idx = [0]
+        c_key = None
+        for key, space in action_space.spaces.items():
+            if isinstance(space, spaces.Discrete):
+                d_key = key
+            else:
+                if c_key is None:
+                    c_key = re.split(r'(\d+)', key)[0]
+                parameters_min.append(space.low)
+                parameters_max.append(space.high)
+                idx.append(len(space.low) + idx[-1])
+
+        parameters_min = np.concatenate(parameters_min)
+        parameters_max = np.concatenate(parameters_max)
+        parameters_num = len(parameters_min)
+        mask = np.zeros((len(idx) - 1, parameters_num), dtype=np.int8)
+        for i in range(len(idx) - 1):
+            mask[i, idx[i]:idx[i + 1]] = 1
+
+        print(f"parameters_min: {parameters_min}, parameters_max: {parameters_max}, parameters_num: {parameters_num}, mask: {mask}")
+
+        # Generate the new action space
+        action_space = spaces.Dict({
+            d_key: spaces.Discrete(len(idx) - 1),
+            c_key: spaces.Box(parameters_min, parameters_max)
+        })
+
+        return action_space, d_key, c_key, mask
 
     def learn(
         self: SelfHPPO,

@@ -31,7 +31,7 @@ from stable_baselines3.common.torch_layers import (
     create_mlp,
 )
 from stable_baselines3.common.type_aliases import PyTorchObs, PyTorchAct, Schedule
-from stable_baselines3.common.utils import get_device, is_vectorized_observation, obs_as_tensor, separate_action
+from stable_baselines3.common.utils import get_device, is_vectorized_observation, obs_as_tensor
 
 SelfBaseModel = TypeVar("SelfBaseModel", bound="BaseModel")
 
@@ -315,6 +315,19 @@ class BasePolicy(BaseModel, ABC):
             if module.bias is not None:
                 module.bias.data.fill_(0.0)
 
+    def restore_action(self, action: Optional[Union[Dict, List[Dict]]] = None,
+                      original_action_space: Optional[spaces.Space] = None):
+        """
+        Restore the concatenated action into the original action space format.
+        Default implementation returns action as-is.
+        Subclasses can override this for custom action space transformations.
+        
+        :param action: The action to restore
+        :param original_action_space: The original action space (for initialization)
+        :return: Restored action (by default, returns action unchanged)
+        """
+        return action
+
     @abstractmethod
     def _predict(self, observation: PyTorchObs, deterministic: bool = False) -> Union[th.Tensor, PyTorchAct]:
         """
@@ -411,8 +424,8 @@ class BasePolicy(BaseModel, ABC):
         if isinstance(self.action_space, spaces.Dict):
             actions = [{key: actions[key][i] for key in actions} for i in range(len(next(iter(actions.values()))))]
             # Attention: the output action is concatenated in the parameters dimension
-            # before the action is passed to the environment, the action should be split
-            actions = separate_action(action=actions)
+            # before the action is passed to the environment, the action should be restored
+            actions = self.restore_action(action=actions)
 
         return actions, state  # type: ignore[return-value]
 

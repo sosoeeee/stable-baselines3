@@ -83,6 +83,10 @@ class HybridActorCriticPolicy(BasePolicy):
             c_key: str = 'params',
             mask: Optional[np.ndarray] = None,
     ):
+        # Initialize action space separation info
+        self._type_key = None
+        self._parameter_key = None
+        self._parameter_index = [0]
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
             # Small values to avoid NaN in Adam optimizer
@@ -446,6 +450,42 @@ class HybridActorCriticPolicy(BasePolicy):
         actions[self.c_key] = con_distribution.get_actions(deterministic=deterministic)
 
         return actions
+
+    def restore_action(self, action: Optional[Union[Dict, List[Dict]]] = None, 
+                      original_action_space: Optional[spaces.Dict] = None):
+        """
+        Restore the concatenated action into the original action space format.
+        This is specific to HPPO's action space reorganization strategy.
+        
+        :param action: The action to restore
+        :param original_action_space: The original action space (for initialization)
+        :return: Restored action in original format
+        """
+        import re
+        
+        # Initialize if needed
+        if original_action_space is not None and (self._type_key is None or self._parameter_key is None):
+            for key, space in original_action_space.spaces.items():
+                if isinstance(space, spaces.Discrete):
+                    self._type_key = key
+                else:
+                    # split number and name
+                    if self._parameter_key is None:
+                        self._parameter_key = re.split(r'(\d+)', key)[0]
+                    self._parameter_index.append(len(space.low) + self._parameter_index[-1])
+            print(f"TYPE_KEY: {self._type_key}, PARAMETER_KEY: {self._parameter_key}, PARAMETER_INDEX: {self._parameter_index}")
+
+        if action is None:
+            return None
+
+        if isinstance(action, dict):
+            type_ = action[self._type_key]
+            paras_ = action[self._parameter_key][self._parameter_index[type_]:self._parameter_index[type_ + 1]]
+            return {self._type_key: type_, self._parameter_key+str(type_): paras_}
+        else:
+            return [{self._type_key: a[self._type_key],
+                     self._parameter_key+str(a[self._type_key]): a[self._parameter_key][self._parameter_index[a[self._type_key]]:self._parameter_index[a[self._type_key] + 1]]} for a in
+                    action]
 
     def predict_values(self, obs: PyTorchObs) -> th.Tensor:
         """

@@ -12,7 +12,7 @@ from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer, H
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import obs_as_tensor, safe_mean, separate_action, get_schedule_fn
+from stable_baselines3.common.utils import obs_as_tensor, safe_mean, get_schedule_fn
 from stable_baselines3.common.vec_env import VecEnv
 
 SelfOnPolicyAlgorithm = TypeVar("SelfOnPolicyAlgorithm", bound="OnPolicyAlgorithm")
@@ -322,8 +322,10 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             # Convert to array of dictionaries for vectorized environments
             if isinstance(self.action_space, spaces.Dict):
                 clipped_actions = [{key: clipped_actions[key][i] for key in clipped_actions} for i in range(len(next(iter(clipped_actions.values()))))]
-                # separate the action on parameters dimension
-                clipped_actions = separate_action(action=clipped_actions)
+                # Restore the action to original format
+                if hasattr(self.policy, 'restore_action'):
+                    clipped_actions = self.policy.restore_action(action=clipped_actions)
+                # else: keep clipped_actions as-is for policies that don't need restoration
 
             new_obs, rewards, dones, infos = env.step(clipped_actions)
 
