@@ -128,7 +128,7 @@ class HybridActor(BasePolicy):
         """
         Get the parameters for parameter (continuous) distribution conditioned on discrete action.
         Similar to SAC's get_action_dist_params.
-        Uses the appropriate sub-network for each discrete action.
+        Uses pre-computed outputs from all sub-networks and indexes by discrete action.
         
         :param obs: Observation
         :param discrete_action: Discrete action (batch_size,)
@@ -137,29 +137,60 @@ class HybridActor(BasePolicy):
         features = self.extract_features(obs, self.features_extractor)
         batch_size = features.shape[0]
         
-        # Initialize mean and log_std tensors
-        mean = th.zeros(batch_size, self.max_param_dim, device=features.device)
-        log_std = th.zeros(batch_size, self.max_param_dim, device=features.device)
+        # Pre-compute outputs from all sub-networks
+        # This avoids dynamic masking and allows efficient batch indexing
+        all_means = []
+        all_log_stds = []
         
-        # For each discrete action, use the corresponding sub-network
         for action_idx in range(self.n_discrete_actions):
-            # Find which samples have this discrete action
-            mask = (discrete_action == action_idx)
-            if not mask.any():
-                continue
-            
-            # Get the sub-network for this action
             param_net = self.param_networks[action_idx]
-            
-            # Forward pass through the sub-network for the masked features
-            latent = param_net['latent'](features[mask])
-            mean[mask] = param_net['mu'](latent)
-            log_std[mask] = param_net['log_std'](latent)
+            latent = param_net['latent'](features)
+            all_means.append(param_net['mu'](latent))
+            all_log_stds.append(param_net['log_std'](latent))
+        
+        # Stack to (batch_size, n_discrete_actions, max_param_dim)
+        all_means = th.stack(all_means, dim=1)
+        all_log_stds = th.stack(all_log_stds, dim=1)
+        
+        # Index by discrete action to get the corresponding mean and log_std
+        # discrete_action: (batch_size,) -> expand to (batch_size, 1, max_param_dim) for gather
+        batch_indices = th.arange(batch_size, device=features.device)
+        mean = all_means[batch_indices, discrete_action.long()]  # (batch_size, max_param_dim)
+        log_std = all_log_stds[batch_indices, discrete_action.long()]  # (batch_size, max_param_dim)
         
         # Clamp log_std (similar to SAC)
         log_std = th.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
         
         return mean, log_std, {}
+
+    def get_all_param_dist_params(self, obs: PyTorchObs) -> Tuple[th.Tensor, th.Tensor]:
+        """
+        Get the parameters for ALL discrete actions' parameter distributions.
+        This is used for vectorized actor loss computation.
+        
+        :param obs: Observation (batch_size, obs_dim)
+        :return: Mean and log_std for all discrete actions
+                 mean: (batch_size, n_discrete_actions, max_param_dim)
+                 log_std: (batch_size, n_discrete_actions, max_param_dim)
+        """
+        features = self.extract_features(obs, self.features_extractor)
+        batch_size = features.shape[0]
+        
+        # Pre-allocate tensors for all discrete actions
+        all_means = th.zeros(batch_size, self.n_discrete_actions, self.max_param_dim, device=features.device)
+        all_log_stds = th.zeros(batch_size, self.n_discrete_actions, self.max_param_dim, device=features.device)
+        
+        # Compute for each discrete action (no masking needed, all actions computed)
+        for action_idx in range(self.n_discrete_actions):
+            param_net = self.param_networks[action_idx]
+            latent = param_net['latent'](features)
+            all_means[:, action_idx, :] = param_net['mu'](latent)
+            all_log_stds[:, action_idx, :] = param_net['log_std'](latent)
+        
+        # Clamp log_std
+        all_log_stds = th.clamp(all_log_stds, LOG_STD_MIN, LOG_STD_MAX)
+        
+        return all_means, all_log_stds
 
     def forward(self, obs: PyTorchObs, deterministic: bool = False) -> Tuple[Dict[str, th.Tensor], th.Tensor, th.Tensor]:
         """
@@ -344,6 +375,42 @@ class HybridCritic(BaseModel):
         q_input = th.cat([features, discrete_one_hot, continuous_action], dim=1)
         
         return self.q_networks[0](q_input)
+
+    def q1_forward_all_discrete(
+        self, obs: PyTorchObs, all_continuous_actions: th.Tensor
+    ) -> th.Tensor:
+        """
+        Compute Q-values for all discrete actions at once using the first Q-network.
+        This is used for vectorized actor loss computation.
+        
+        :param obs: Observation (batch_size, obs_dim)
+        :param all_continuous_actions: Continuous actions for all discrete actions
+                                       (batch_size, n_discrete_actions, max_param_dim)
+        :return: Q-values for all discrete actions (batch_size, n_discrete_actions, 1)
+        """
+        # Extract features (no gradient through features extractor for actor update)
+        features = self.extract_features(obs, self.features_extractor)
+        batch_size = features.shape[0]
+        
+        # Expand features for all discrete actions: (batch_size, n_discrete_actions, features_dim)
+        features_expanded = features.unsqueeze(1).expand(-1, self.n_discrete_actions, -1)
+        
+        # Create one-hot for all discrete actions: (n_discrete_actions, n_discrete_actions)
+        all_one_hots = th.eye(self.n_discrete_actions, device=features.device)
+        # Expand to batch: (batch_size, n_discrete_actions, n_discrete_actions)
+        all_one_hots = all_one_hots.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        # Concatenate: (batch_size, n_discrete_actions, features_dim + n_discrete_actions + max_param_dim)
+        q_input = th.cat([features_expanded, all_one_hots, all_continuous_actions], dim=-1)
+        
+        # Reshape for batch processing: (batch_size * n_discrete_actions, input_dim)
+        q_input_flat = q_input.reshape(-1, q_input.shape[-1])
+        
+        # Compute Q-values using first Q-network
+        q_flat = self.q_networks[0](q_input_flat)  # (batch_size * n_discrete_actions, 1)
+        q_values = q_flat.reshape(batch_size, self.n_discrete_actions, 1)
+        
+        return q_values
 
 
 class HybridSACPolicy(BasePolicy):

@@ -338,7 +338,7 @@ class HSAC(OffPolicyAlgorithm):
             critic_loss.backward()
             self.critic.optimizer.step()
 
-            # Compute actor loss
+            # Compute actor loss - VECTORIZED VERSION
             # For hybrid SAC: we marginalize over discrete actions
             # actor_loss = E_a[pi(a|s) * (alpha_task*log(pi(a|s)) + alpha_param*log(pi(x|s,a)) - Q(s,a,x))]
             
@@ -346,41 +346,45 @@ class HSAC(OffPolicyAlgorithm):
             logits = self.actor.get_task_dist_params(replay_data.observations)
             task_dist = th.distributions.Categorical(logits=logits)
             task_probs = task_dist.probs  # (batch_size, n_discrete_actions)
+            # Log probabilities for all discrete actions
+            task_log_probs = th.log_softmax(logits, dim=-1)  # (batch_size, n_discrete_actions)
             
-            actor_loss = 0.0
-            for a in range(self.n_discrete_actions):
-                # Probability of this discrete action
-                prob_a = task_probs[:, a].unsqueeze(1)  # (batch_size, 1)
-                
-                # Create action tensor for this discrete action
-                discrete_action_a = th.full((batch_size,), a, dtype=th.long, device=self.device)
-                
-                # Get parameter distribution parameters conditioned on this discrete action
-                mean_actions, log_std, kwargs = self.actor.get_param_dist_params(replay_data.observations, discrete_action_a)
-                continuous_action_a, continuous_log_prob_a = self.actor.param_action_dist.log_prob_from_params(
-                    mean_actions, log_std, **kwargs
-                )
-                
-                # Compute log prob of discrete action
-                discrete_log_prob_a = task_dist.log_prob(discrete_action_a)
-                
-                # Assemble hybrid action
-                hybrid_action_a = {
-                    self.d_key: discrete_action_a,
-                    self.c_key: continuous_action_a,
-                }
-                
-                # Compute Q-value for this action
-                q_value_a = self.critic.q1_forward(replay_data.observations, hybrid_action_a)
-                
-                # Actor loss component for this discrete action
-                # prob_a * (alpha_task * log_prob(a) + alpha_param * log_prob(x|a) - Q(s,a,x))
-                loss_component = prob_a * (
-                    ent_coef_task * discrete_log_prob_a.unsqueeze(1) +
-                    ent_coef_param * continuous_log_prob_a.unsqueeze(1) -
-                    q_value_a
-                )
-                actor_loss = actor_loss + loss_component.mean()
+            # Get all parameter distributions at once
+            # all_means, all_log_stds: (batch_size, n_discrete_actions, max_param_dim)
+            all_means, all_log_stds = self.actor.get_all_param_dist_params(replay_data.observations)
+            
+            # Sample continuous actions for all discrete actions using reparameterization trick
+            all_stds = th.exp(all_log_stds)
+            noise = th.randn_like(all_means)
+            all_continuous_pretanh = all_means + all_stds * noise
+            all_continuous_actions = th.tanh(all_continuous_pretanh)
+            
+            # Compute log prob for continuous actions (tanh squashed gaussian)
+            # log_prob = N(pretanh|mean, std).log_prob - log(1 - tanh(pretanh)^2)
+            gaussian_log_prob = -0.5 * (
+                ((all_continuous_pretanh - all_means) / (all_stds + 1e-6)) ** 2 
+                + 2 * all_log_stds 
+                + np.log(2 * np.pi)
+            )
+            gaussian_log_prob = gaussian_log_prob.sum(dim=-1)  # (batch_size, n_discrete_actions)
+            
+            # Squashing correction
+            squash_correction = th.log(1 - all_continuous_actions ** 2 + 1e-6).sum(dim=-1)
+            all_continuous_log_probs = gaussian_log_prob - squash_correction  # (batch_size, n_discrete_actions)
+            
+            # Compute Q-values for all discrete actions at once
+            # all_q_values: (batch_size, n_discrete_actions, 1)
+            all_q_values = self.critic.q1_forward_all_discrete(replay_data.observations, all_continuous_actions)
+            all_q_values = all_q_values.squeeze(-1)  # (batch_size, n_discrete_actions)
+            
+            # Compute weighted actor loss
+            # actor_loss = sum_a [ pi(a|s) * (alpha_task * log(pi(a|s)) + alpha_param * log(pi(x|s,a)) - Q(s,a,x)) ]
+            weighted_loss = task_probs * (
+                ent_coef_task * task_log_probs +
+                ent_coef_param * all_continuous_log_probs -
+                all_q_values
+            )  # (batch_size, n_discrete_actions)
+            actor_loss = weighted_loss.sum(dim=1).mean()  # Sum over discrete actions, mean over batch
             
             actor_losses.append(actor_loss.item())
 
