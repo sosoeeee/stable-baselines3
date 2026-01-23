@@ -142,19 +142,19 @@ class HybridActor(BasePolicy):
         log_std = th.zeros(batch_size, self.max_param_dim, device=features.device)
         
         # For each discrete action, use the corresponding sub-network
-        # for action_idx in range(self.n_discrete_actions):
-        #     # Find which samples have this discrete action
-        #     # mask = (discrete_action == action_idx)
-        #     # if not mask.any():
-        #         # continue
+        for action_idx in range(self.n_discrete_actions):
+            # Find which samples have this discrete action
+            mask = (discrete_action == action_idx)
+            if not mask.any():
+                continue
             
-        #     # Get the sub-network for this action
-        param_net = self.param_networks[discrete_action]
-        
-        # Forward pass through the sub-network
-        latent = param_net['latent'](features)
-        mean = param_net['mu'](latent)
-        log_std = param_net['log_std'](latent)
+            # Get the sub-network for this action
+            param_net = self.param_networks[action_idx]
+            
+            # Forward pass through the sub-network for the masked features
+            latent = param_net['latent'](features[mask])
+            mean[mask] = param_net['mu'](latent)
+            log_std[mask] = param_net['log_std'](latent)
         
         # Clamp log_std (similar to SAC)
         log_std = th.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
@@ -422,7 +422,13 @@ class HybridSACPolicy(BasePolicy):
 
         actor_arch, critic_arch = get_actor_critic_arch(net_arch)
         self.net_arch = net_arch
-        self.activation_fn = activation_fn
+        activation_fn_by_name = {
+            "tanh": nn.Tanh,
+            "relu": nn.ReLU,
+            "elu": nn.ELU,
+            "leaky_relu": nn.LeakyReLU
+        }
+        self.activation_fn = activation_fn_by_name[activation_fn] if isinstance(activation_fn, str) else activation_fn
 
         self.net_args = {
             "observation_space": self.observation_space,
@@ -512,6 +518,48 @@ class HybridSACPolicy(BasePolicy):
         self.actor.set_training_mode(mode)
         self.critic.set_training_mode(mode)
         self.training = mode
+
+    def _predict_for_buffer(
+        self,
+        observation: Union[np.ndarray, Dict[str, np.ndarray]],
+        deterministic: bool = False,
+    ) -> Tuple[np.ndarray, None]:
+        """
+        Get the policy action in internal format (for storing in replay buffer).
+        Returns action in internal Dict format without restore_action transformation.
+        
+        :param observation: the input observation
+        :param deterministic: Whether or not to return deterministic actions.
+        :return: the model's action in internal format and None (for state compatibility)
+        """
+        # Switch to eval mode
+        self.set_training_mode(False)
+
+        obs_tensor, vectorized_env = self.obs_to_tensor(observation)
+
+        with th.no_grad():
+            actions = self._predict(obs_tensor, deterministic=deterministic)
+
+        # Convert tensor to numpy, and reshape to the original action shape
+        for key, act in actions.items():
+            actions[key] = act.cpu().numpy().reshape((-1, *self.action_space.spaces[key].shape))
+
+        # Handle continuous actions with squashing
+        for key, act in actions.items():
+            if isinstance(self.action_space.spaces[key], spaces.Box):
+                if self.squash_output:
+                    # Rescale to proper domain when using squashing
+                    actions[key] = self.unscale_action(act, self.action_space.spaces[key])
+                else:
+                    # Clip actions to avoid out of bound error
+                    actions[key] = np.clip(act, self.action_space.spaces[key].low, self.action_space.spaces[key].high)
+
+        # Remove batch dimension if needed
+        if not vectorized_env:
+            for key, act in actions.items():
+                actions[key] = act.squeeze(axis=0)
+
+        return actions, None
 
     def restore_action(
         self,

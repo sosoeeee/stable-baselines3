@@ -383,14 +383,20 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             # Warmup phase
             unscaled_action = np.array([self.action_space.sample() for _ in range(n_envs)])
             if isinstance(self.action_space, spaces.Dict):
-                # Convert to dictionary of arrays
-                unscaled_action = {key: np.array([unscaled_action[i][key] for i in range(n_envs)]) for key in unscaled_action[0]}
+                # Convert from list of dicts to dict of arrays
+                unscaled_action_dict = {}
+                for key in unscaled_action[0].keys():
+                    unscaled_action_dict[key] = np.array([unscaled_action[i][key] for i in range(len(unscaled_action))])
+                unscaled_action = unscaled_action_dict
         else:
             # Note: when using continuous actions,
             # we assume that the policy uses tanh to scale the action
             # We use non-deterministic action in the case of SAC, for TD3, it does not matter
             assert self._last_obs is not None, "self._last_obs was not set"
-            unscaled_action, _ = self.predict(self._last_obs, deterministic=False)
+            # Use _predict_for_buffer to get internal action format for buffer storage
+            # For standard policies, this behaves like predict()
+            # For hybrid action policies (e.g., HSAC), this returns internal action format
+            unscaled_action, _ = self.policy._predict_for_buffer(self._last_obs, deterministic=False)
 
         # Rescale the action from [low, high] to [-1, 1]
         if isinstance(self.action_space, spaces.Box):
@@ -405,7 +411,8 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             action = self.policy.unscale_action(scaled_action)
         elif isinstance(self.action_space, spaces.Dict):
             # Hybrid action case: handle Dict actions
-            # Scale and add noise to each Box action
+            # unscaled_action is already in internal format from _predict_for_buffer
+            # Convert from list of dicts to dict of arrays for processing
             scaled_action = {}
             for key, act in unscaled_action.items():
                 if isinstance(self.action_space.spaces[key], spaces.Box):
@@ -417,19 +424,22 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                 else:
                     # Discrete case, keep action as-is
                     scaled_action[key] = act
-
+            # Store scaled internal action in buffer
             buffer_action = scaled_action
-            # Convert to array of dictionaries for vectorized environments
-            action = [{key: unscaled_action[key][i] for key in unscaled_action} for i in range(len(next(iter(unscaled_action.values()))))]
             
-            # Restore the action to original format
+            # Restore the action to original format for environment interaction
             if hasattr(self.policy, 'restore_action'):
-                action = self.policy.restore_action(action=action)
-            # else: keep action as-is for policies that don't need restoration
+                # Convert back to list of dicts first
+                actions = [{key: unscaled_action[key][i] for key in unscaled_action} for i in range(len(next(iter(unscaled_action.values()))))]
+                action = self.policy.restore_action(action=actions)
+            else:
+                # No restoration needed, convert back to list of dicts
+                action = [{key: unscaled_action[key][i] for key in unscaled_action} for i in range(len(next(iter(unscaled_action.values()))))]
         else:
             # Discrete case, no need to normalize or clip
             buffer_action = unscaled_action
             action = buffer_action
+            
         return action, buffer_action
 
     def _dump_logs(self) -> None:

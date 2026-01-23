@@ -341,6 +341,27 @@ class BasePolicy(BaseModel, ABC):
         :return: Taken action according to the policy
         """
 
+    def _predict_for_buffer(
+        self,
+        observation: Union[np.ndarray, Dict[str, np.ndarray]],
+        deterministic: bool = False,
+    ) -> Tuple[np.ndarray, None]:
+        """
+        Get the policy action in internal format (for storing in replay buffer).
+        This is used by off-policy algorithms to get actions in the internal representation
+        that matches the policy's action space (before restore_action transformation).
+        
+        By default, calls predict() and returns the action before restore_action.
+        For policies that use restore_action (e.g., HSAC), this should be overridden.
+        
+        :param observation: the input observation
+        :param deterministic: Whether or not to return deterministic actions.
+        :return: the model's action in internal format and None (for state compatibility)
+        """
+        # Default implementation: call predict and assume no restore_action is needed
+        action, _ = self.predict(observation, deterministic=deterministic)
+        return action, None
+
     def predict(
         self,
         observation: Union[np.ndarray, Dict[str, np.ndarray]],
