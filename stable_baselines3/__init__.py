@@ -9,6 +9,7 @@ from stable_baselines3.ppo import PPO
 from stable_baselines3.sac import SAC
 from stable_baselines3.td3 import TD3
 from stable_baselines3.hppo import HPPO
+from stable_baselines3.hsac import HSAC
 
 # Read version from file
 version_file = os.path.join(os.path.dirname(__file__), "version.txt")
@@ -30,6 +31,7 @@ __all__ = [
     "PPO",
     "HPPO",
     "SAC",
+    "HSAC",
     "TD3",
     "HerReplayBuffer",
     "get_system_info",

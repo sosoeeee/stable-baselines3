@@ -402,7 +402,7 @@ class BasePolicy(BaseModel, ABC):
                 if isinstance(self.action_space.spaces[key], spaces.Box):
                     if self.squash_output:
                         # Rescale to proper domain when using squashing
-                        actions[key] = self.unscale_action(act)  # type: ignore[assignment, arg-type]
+                        actions[key] = self.unscale_action(act, self.action_space.spaces[key])  # type: ignore[assignment, arg-type]
                     else:
                         # Actions could be on arbitrary scale, so clip the actions to avoid
                         # out of bound error (e.g. if sampling from a Gaussian distribution)
@@ -429,7 +429,7 @@ class BasePolicy(BaseModel, ABC):
 
         return actions, state  # type: ignore[return-value]
 
-    def scale_action(self, action: np.ndarray) -> np.ndarray:
+    def scale_action(self, action: np.ndarray, action_space: Optional[spaces.Box] = None) -> np.ndarray:
         """
         Rescale the action from [low, high] to [-1, 1]
         (no need for symmetric action space)
@@ -437,23 +437,29 @@ class BasePolicy(BaseModel, ABC):
         :param action: Action to scale
         :return: Scaled action
         """
+        if action_space is None:
+            action_space = self.action_space
+
         assert isinstance(
-            self.action_space, spaces.Box
-        ), f"Trying to scale an action using an action space that is not a Box(): {self.action_space}"
-        low, high = self.action_space.low, self.action_space.high
+            action_space, spaces.Box
+        ), f"Trying to scale an action using an action space that is not a Box(): {action_space}"
+        low, high = action_space.low, action_space.high
         return 2.0 * ((action - low) / (high - low)) - 1.0
 
-    def unscale_action(self, scaled_action: np.ndarray) -> np.ndarray:
+    def unscale_action(self, scaled_action: np.ndarray, action_space: Optional[spaces.Box] = None) -> np.ndarray:
         """
         Rescale the action from [-1, 1] to [low, high]
         (no need for symmetric action space)
 
         :param scaled_action: Action to un-scale
         """
+        if action_space is None:
+            action_space = self.action_space
+
         assert isinstance(
-            self.action_space, spaces.Box
-        ), f"Trying to unscale an action using an action space that is not a Box(): {self.action_space}"
-        low, high = self.action_space.low, self.action_space.high
+            action_space, spaces.Box
+        ), f"Trying to unscale an action using an action space that is not a Box(): {action_space}"
+        low, high = action_space.low, action_space.high
         return low + (0.5 * (scaled_action + 1.0) * (high - low))
 
 

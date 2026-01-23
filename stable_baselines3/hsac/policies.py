@@ -1,0 +1,622 @@
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
+
+import numpy as np
+import torch as th
+from gymnasium import spaces
+from torch import nn
+from torch.nn import functional as F
+
+from stable_baselines3.common.distributions import SquashedDiagGaussianDistribution
+from stable_baselines3.common.policies import BaseModel, BasePolicy
+from stable_baselines3.common.preprocessing import get_action_dim
+from stable_baselines3.common.torch_layers import (
+    BaseFeaturesExtractor,
+    FlattenExtractor,
+    create_mlp,
+    get_actor_critic_arch,
+)
+from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
+
+# CAP the standard deviation of the actor
+LOG_STD_MAX = 2
+LOG_STD_MIN = -20
+
+
+class HybridActor(BasePolicy):
+    """
+    Hybrid Actor network (policy) for Hybrid SAC.
+    
+    Hierarchical structure:
+    - Task Policy: outputs discrete action (categorical distribution)
+    - Parameter Policy: outputs continuous parameters conditioned on discrete action
+    
+    :param observation_space: Observation space
+    :param action_space: Action space (must be spaces.Dict)
+    :param net_arch: Network architecture for both task and parameter networks
+    :param features_extractor: Network to extract features
+    :param features_dim: Number of features
+    :param activation_fn: Activation function
+    :param normalize_images: Whether to normalize images or not
+    :param d_key: Key for discrete action in action space Dict
+    :param c_key: Key prefix for continuous parameters in action space Dict
+    :param n_discrete_actions: Number of discrete actions
+    :param max_param_dim: Maximum dimension of continuous parameters
+    """
+
+    action_space: spaces.Dict
+
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Dict,
+        net_arch: List[int],
+        features_extractor: nn.Module,
+        features_dim: int,
+        activation_fn: Type[nn.Module] = nn.ReLU,
+        normalize_images: bool = True,
+        d_key: str = "discrete",
+        c_key: str = "continuous",
+    ):
+        super().__init__(
+            observation_space,
+            action_space,
+            features_extractor=features_extractor,
+            normalize_images=normalize_images,
+            squash_output=True,
+        )
+
+        self.net_arch = net_arch
+        self.features_dim = features_dim
+        self.activation_fn = activation_fn
+        self.d_key = d_key
+        self.c_key = c_key
+        
+        # Get n_discrete_actions from action space
+        assert isinstance(action_space, spaces.Dict), "Action space must be Dict"
+        assert d_key in action_space.spaces, f"Key {d_key} not found in action space"
+        assert isinstance(action_space.spaces[d_key], spaces.Discrete), "Discrete action must be Discrete space"
+        self.n_discrete_actions = action_space.spaces[d_key].n
+        
+        # Get continuous parameter dimension
+        assert c_key in action_space.spaces, f"Key {c_key} not found in action space"
+        assert isinstance(action_space.spaces[c_key], spaces.Box), "Continuous action must be Box space"
+        self.max_param_dim = int(np.prod(action_space.spaces[c_key].shape))
+
+        # Action distribution for continuous parameters (similar to SAC)
+        self.param_action_dist = SquashedDiagGaussianDistribution(self.max_param_dim, epsilon=1e-6)
+
+        # Task policy network (discrete action)
+        task_net = create_mlp(features_dim, -1, net_arch, activation_fn)
+        self.task_latent = nn.Sequential(*task_net)
+        last_layer_dim_task = net_arch[-1] if len(net_arch) > 0 else features_dim
+        self.task_logits = nn.Linear(last_layer_dim_task, self.n_discrete_actions)
+
+        # Parameter policy network: one sub-network for each discrete action
+        # Each sub-network takes features as input and outputs parameters for that action
+        self.param_networks = nn.ModuleList()
+        for _ in range(self.n_discrete_actions):
+            param_net = create_mlp(features_dim, -1, net_arch, activation_fn)
+            param_latent = nn.Sequential(*param_net)
+            last_layer_dim_param = net_arch[-1] if len(net_arch) > 0 else features_dim
+            
+            # Each sub-network outputs mean and log_std for max_param_dim
+            mu = nn.Linear(last_layer_dim_param, self.max_param_dim)
+            log_std = nn.Linear(last_layer_dim_param, self.max_param_dim)
+            
+            self.param_networks.append(nn.ModuleDict({
+                'latent': param_latent,
+                'mu': mu,
+                'log_std': log_std,
+            }))
+
+    def get_task_dist_params(self, obs: PyTorchObs) -> th.Tensor:
+        """
+        Get the parameters for task (discrete action) distribution.
+        Similar to SAC's get_action_dist_params.
+        
+        :param obs: Observation
+        :return: Logits for categorical distribution
+        """
+        features = self.extract_features(obs, self.features_extractor)
+        task_latent = self.task_latent(features)
+        logits = self.task_logits(task_latent)
+        return logits
+
+    def get_param_dist_params(
+        self, obs: PyTorchObs, discrete_action: th.Tensor
+    ) -> Tuple[th.Tensor, th.Tensor, Dict[str, th.Tensor]]:
+        """
+        Get the parameters for parameter (continuous) distribution conditioned on discrete action.
+        Similar to SAC's get_action_dist_params.
+        Uses the appropriate sub-network for each discrete action.
+        
+        :param obs: Observation
+        :param discrete_action: Discrete action (batch_size,)
+        :return: Mean, log_std, and optional keyword arguments
+        """
+        features = self.extract_features(obs, self.features_extractor)
+        batch_size = features.shape[0]
+        
+        # Initialize mean and log_std tensors
+        mean = th.zeros(batch_size, self.max_param_dim, device=features.device)
+        log_std = th.zeros(batch_size, self.max_param_dim, device=features.device)
+        
+        # For each discrete action, use the corresponding sub-network
+        # for action_idx in range(self.n_discrete_actions):
+        #     # Find which samples have this discrete action
+        #     # mask = (discrete_action == action_idx)
+        #     # if not mask.any():
+        #         # continue
+            
+        #     # Get the sub-network for this action
+        param_net = self.param_networks[discrete_action]
+        
+        # Forward pass through the sub-network
+        latent = param_net['latent'](features)
+        mean = param_net['mu'](latent)
+        log_std = param_net['log_std'](latent)
+        
+        # Clamp log_std (similar to SAC)
+        log_std = th.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        
+        return mean, log_std, {}
+
+    def forward(self, obs: PyTorchObs, deterministic: bool = False) -> Tuple[Dict[str, th.Tensor], th.Tensor, th.Tensor]:
+        """
+        Forward pass: sample both discrete and continuous actions.
+        Similar to SAC's forward method.
+        
+        :param obs: Observation
+        :param deterministic: Whether to use deterministic actions
+        :return: Dictionary of actions, discrete log prob, continuous log prob
+        """
+        # Get task distribution parameters and sample discrete action
+        logits = self.get_task_dist_params(obs)
+        task_dist = th.distributions.Categorical(logits=logits)
+        if deterministic:
+            discrete_action = th.argmax(task_dist.probs, dim=1)
+        else:
+            discrete_action = task_dist.sample()
+        discrete_log_prob = task_dist.log_prob(discrete_action)
+        
+        # Get parameter distribution parameters and sample continuous action
+        # Use actions_from_params similar to SAC
+        mean_actions, log_std, kwargs = self.get_param_dist_params(obs, discrete_action)
+        continuous_action = self.param_action_dist.actions_from_params(
+            mean_actions, log_std, deterministic=deterministic, **kwargs
+        )
+        continuous_log_prob = self.param_action_dist.log_prob(continuous_action)
+        
+        actions = {
+            self.d_key: discrete_action,
+            self.c_key: continuous_action,
+        }
+        
+        return actions, discrete_log_prob, continuous_log_prob
+
+    def action_log_prob(self, obs: PyTorchObs) -> Tuple[Dict[str, th.Tensor], th.Tensor, th.Tensor]:
+        """
+        Sample actions and compute log probabilities (for training).
+        Similar to SAC's action_log_prob method.
+        
+        :param obs: Observation
+        :return: Actions, discrete log prob, continuous log prob
+        """
+        # Get task distribution parameters and sample discrete action
+        logits = self.get_task_dist_params(obs)
+        task_dist = th.distributions.Categorical(logits=logits)
+        discrete_action = task_dist.sample()
+        discrete_log_prob = task_dist.log_prob(discrete_action)
+        
+        # Get parameter distribution parameters and sample continuous action
+        # Use log_prob_from_params similar to SAC
+        mean_actions, log_std, kwargs = self.get_param_dist_params(obs, discrete_action)
+        continuous_action, continuous_log_prob = self.param_action_dist.log_prob_from_params(
+            mean_actions, log_std, **kwargs
+        )
+        
+        actions = {
+            self.d_key: discrete_action,
+            self.c_key: continuous_action,
+        }
+        
+        return actions, discrete_log_prob, continuous_log_prob
+
+    def _predict(self, observation: PyTorchObs, deterministic: bool = False) -> Dict[str, th.Tensor]:
+        """
+        Predict action (used by BasePolicy.predict).
+        
+        :param observation: Observation
+        :param deterministic: Whether to use deterministic actions
+        :return: Dictionary of actions
+        """
+        actions, _, _ = self.forward(observation, deterministic=deterministic)
+        return actions
+
+
+class HybridCritic(BaseModel):
+    """
+    Hybrid Critic network (Q-function) for Hybrid SAC.
+    
+    Takes (observation, discrete_action, continuous_action) as input.
+    
+    :param observation_space: Observation space
+    :param action_space: Action space (must be spaces.Dict)
+    :param net_arch: Network architecture
+    :param features_extractor: Network to extract features
+    :param features_dim: Number of features
+    :param activation_fn: Activation function
+    :param normalize_images: Whether to normalize images or not
+    :param n_critics: Number of critic networks (typically 2 for SAC)
+    :param d_key: Key for discrete action in action space Dict
+    :param c_key: Key for continuous parameters in action space Dict
+    :param share_features_extractor: Whether the features extractor is shared or not
+        between the actor and the critic (this saves computation time)
+    """
+
+    features_extractor: BaseFeaturesExtractor
+
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Dict,
+        net_arch: List[int],
+        features_extractor: BaseFeaturesExtractor,
+        features_dim: int,
+        activation_fn: Type[nn.Module] = nn.ReLU,
+        normalize_images: bool = True,
+        n_critics: int = 2,
+        d_key: str = "discrete",
+        c_key: str = "continuous",
+        share_features_extractor: bool = True,
+    ):
+        super().__init__(
+            observation_space,
+            action_space,
+            features_extractor=features_extractor,
+            normalize_images=normalize_images,
+        )
+
+        self.share_features_extractor = share_features_extractor
+        self.n_critics = n_critics
+        self.d_key = d_key
+        self.c_key = c_key
+        
+        # Get parameters from action space
+        assert isinstance(action_space, spaces.Dict), "Action space must be Dict"
+        self.n_discrete_actions = action_space.spaces[d_key].n
+        self.max_param_dim = int(np.prod(action_space.spaces[c_key].shape))
+
+        # Input: features + one-hot discrete action + continuous action
+        q_input_dim = features_dim + self.n_discrete_actions + self.max_param_dim
+
+        # Create multiple Q-networks
+        self.q_networks: List[nn.Module] = []
+        for idx in range(n_critics):
+            q_net_list = create_mlp(q_input_dim, 1, net_arch, activation_fn)
+            q_net = nn.Sequential(*q_net_list)
+            self.add_module(f"qf{idx}", q_net)
+            self.q_networks.append(q_net)
+
+    def forward(self, obs: PyTorchObs, actions: Dict[str, th.Tensor]) -> Tuple[th.Tensor, ...]:
+        """
+        Forward pass through all Q-networks.
+        
+        :param obs: Observation
+        :param actions: Dictionary with discrete and continuous actions
+        :return: Tuple of Q-values from each critic
+        """
+        # Learn the features extractor using the policy loss only
+        # when the features_extractor is shared with the actor
+        with th.set_grad_enabled(not self.share_features_extractor):
+            features = self.extract_features(obs, self.features_extractor)
+        
+        # Get discrete and continuous actions
+        discrete_action = actions[self.d_key]
+        continuous_action = actions[self.c_key]
+        
+        # One-hot encode discrete action
+        discrete_one_hot = F.one_hot(discrete_action.long().flatten(), num_classes=self.n_discrete_actions).float()
+        
+        # Concatenate features, one-hot discrete action, and continuous action
+        q_input = th.cat([features, discrete_one_hot, continuous_action], dim=1)
+        
+        # Compute Q-values from each critic
+        return tuple(q_net(q_input) for q_net in self.q_networks)
+
+    def q1_forward(self, obs: PyTorchObs, actions: Dict[str, th.Tensor]) -> th.Tensor:
+        """
+        Only predict the Q-value using the first network.
+        This allows to reduce computation when all the estimates are not needed
+        (e.g. when updating the policy in TD3).
+        
+        :param obs: Observation
+        :param actions: Dictionary with discrete and continuous actions
+        :return: Q-value from first critic
+        """
+        with th.no_grad():
+            features = self.extract_features(obs, self.features_extractor)
+        
+        discrete_action = actions[self.d_key]
+        continuous_action = actions[self.c_key]
+        
+        discrete_one_hot = F.one_hot(discrete_action.long().flatten(), num_classes=self.n_discrete_actions).float()
+        q_input = th.cat([features, discrete_one_hot, continuous_action], dim=1)
+        
+        return self.q_networks[0](q_input)
+
+
+class HybridSACPolicy(BasePolicy):
+    """
+    Policy class for Hybrid SAC algorithm.
+    
+    :param observation_space: Observation space
+    :param action_space: Action space (must be spaces.Dict)
+    :param lr_schedule: Learning rate schedule
+    :param net_arch: Network architecture
+    :param activation_fn: Activation function
+    :param features_extractor_class: Features extractor class
+    :param features_extractor_kwargs: Features extractor kwargs
+    :param normalize_images: Whether to normalize images
+    :param optimizer_class: Optimizer class
+    :param optimizer_kwargs: Optimizer kwargs
+    :param n_critics: Number of critic networks
+    :param d_key: Key for discrete action
+    :param c_key: Key for continuous parameters
+    :param n_discrete_actions: Number of discrete actions
+    :param max_param_dim: Maximum dimension of continuous parameters
+    """
+
+    actor: HybridActor
+    critic: HybridCritic
+    critic_target: HybridCritic
+
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Dict,
+        lr_schedule: Schedule,
+        net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
+        activation_fn: Type[nn.Module] = nn.ReLU,
+        use_sde: bool = False,
+        features_extractor_class: Type[BaseFeaturesExtractor] = FlattenExtractor,
+        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+        normalize_images: bool = True,
+        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        n_critics: int = 2,
+        d_key: str = "discrete",
+        c_key: str = "continuous",
+        share_features_extractor: bool = False,
+    ):
+        super().__init__(
+            observation_space,
+            action_space,
+            features_extractor_class,
+            features_extractor_kwargs,
+            optimizer_class=optimizer_class,
+            optimizer_kwargs=optimizer_kwargs,
+            squash_output=True,
+        )
+
+        # Note: use_sde is not used in HSAC, but accepted for compatibility
+        self.use_sde = use_sde
+        self.d_key = d_key
+        self.c_key = c_key
+        
+        # Get parameters from action space
+        assert isinstance(action_space, spaces.Dict), "Action space must be Dict"
+        self.n_discrete_actions = action_space.spaces[d_key].n
+        self.max_param_dim = int(np.prod(action_space.spaces[c_key].shape))
+        
+        # For action restoration
+        self._type_key = None
+        self._parameter_key = None
+        self._parameter_dims = []
+        self._parameter_lows = []
+        self._parameter_highs = []
+
+        # Default network architecture
+        if net_arch is None:
+            net_arch = [256, 256]
+
+        actor_arch, critic_arch = get_actor_critic_arch(net_arch)
+        self.net_arch = net_arch
+        self.activation_fn = activation_fn
+
+        self.net_args = {
+            "observation_space": self.observation_space,
+            "action_space": self.action_space,
+            "net_arch": actor_arch,
+            "activation_fn": self.activation_fn,
+            "normalize_images": normalize_images,
+        }
+        self.actor_kwargs = self.net_args.copy()
+        self.critic_kwargs = self.net_args.copy()
+        self.critic_kwargs.update(
+            {
+                "n_critics": n_critics,
+                "net_arch": critic_arch,
+                "share_features_extractor": share_features_extractor,
+            }
+        )
+
+        self.share_features_extractor = share_features_extractor
+
+        self._build(lr_schedule)
+
+    def _build(self, lr_schedule: Schedule) -> None:
+        """Build networks."""
+        # Create actor
+        self.actor = self.make_actor()
+        self.actor.optimizer = self.optimizer_class(
+            self.actor.parameters(),
+            lr=lr_schedule(1),
+            **self.optimizer_kwargs,
+        )
+
+        # Create critics (Q-networks)
+        if self.share_features_extractor:
+            self.critic = self.make_critic(features_extractor=self.actor.features_extractor)
+            # Do not optimize the shared features extractor with the critic loss
+            # otherwise, there are gradient computation issues
+            critic_parameters = [param for name, param in self.critic.named_parameters() if "features_extractor" not in name]
+        else:
+            # Create a separate features extractor for the critic
+            # this requires more memory and computation
+            self.critic = self.make_critic(features_extractor=None)
+            critic_parameters = list(self.critic.parameters())
+
+        self.critic_target = self.make_critic(features_extractor=None)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        
+        self.critic.optimizer = self.optimizer_class(
+            critic_parameters,
+            lr=lr_schedule(1),
+            **self.optimizer_kwargs,
+        )
+
+        # Target networks should always be in eval mode
+        self.critic_target.set_training_mode(False)
+
+    def make_actor(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> HybridActor:
+        """Create actor network."""
+        actor_kwargs = self._update_features_extractor(
+            self.actor_kwargs, features_extractor=features_extractor
+        )
+        return HybridActor(**actor_kwargs).to(self.device)
+
+    def make_critic(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> HybridCritic:
+        """Create critic network."""
+        critic_kwargs = self._update_features_extractor(
+            self.critic_kwargs, features_extractor=features_extractor
+        )
+        return HybridCritic(**critic_kwargs).to(self.device)
+
+    def forward(self, obs: PyTorchObs, deterministic: bool = False) -> Dict[str, th.Tensor]:
+        """Forward pass."""
+        return self._predict(obs, deterministic=deterministic)
+
+    def _predict(self, observation: PyTorchObs, deterministic: bool = False) -> Dict[str, th.Tensor]:
+        """Predict action."""
+        return self.actor._predict(observation, deterministic=deterministic)
+
+    def set_training_mode(self, mode: bool) -> None:
+        """
+        Put the policy in either training or evaluation mode.
+
+        This affects certain modules, such as batch normalisation and dropout.
+
+        :param mode: if true, set to training mode, else set to evaluation mode
+        """
+        self.actor.set_training_mode(mode)
+        self.critic.set_training_mode(mode)
+        self.training = mode
+
+    def restore_action(
+        self,
+        action: Optional[Union[Dict, List[Dict]]] = None,
+        original_action_space: Optional[spaces.Dict] = None,
+    ):
+        """
+        Restore the internal action format to the original gym environment format.
+        Internal format: Dict(discrete=Discrete(n), continuous=Box(max_dim))
+        Original format: Dict(id=Discrete(n), params0=Box(...), params1=Box(...), ...)
+        
+        All parameter fields are returned, with unused parameters filled with -1.
+        
+        :param action: The action to restore (None for initialization)
+        :param original_action_space: The original action space (for initialization)
+        :return: Restored action in original format
+        """
+        import re
+        
+        # Initialize if needed
+        if original_action_space is not None and (self._type_key is None or self._parameter_key is None):
+            self._parameter_dims = []
+            self._parameter_lows = []
+            self._parameter_highs = []
+            for key, space in original_action_space.spaces.items():
+                if isinstance(space, spaces.Discrete):
+                    self._type_key = key
+                else:
+                    # Extract parameter key prefix (e.g., 'params' from 'params0')
+                    if self._parameter_key is None:
+                        self._parameter_key = re.split(r'(\d+)', key)[0]
+                    # Store dimension and bounds of each parameter
+                    param_dim = int(np.prod(space.shape))
+                    self._parameter_dims.append(param_dim)
+                    if isinstance(space, spaces.Box):
+                        self._parameter_lows.append(space.low.flatten())
+                        self._parameter_highs.append(space.high.flatten())
+                    else:
+                        # Fallback for non-Box spaces
+                        self._parameter_lows.append(np.full(param_dim, -1.0))
+                        self._parameter_highs.append(np.full(param_dim, 1.0))
+            
+            print(f"TYPE_KEY: {self._type_key}, PARAMETER_KEY: {self._parameter_key}, PARAMETER_DIMS: {self._parameter_dims}")
+        
+        if action is None:
+            return None
+        
+        # Restore single action
+        if isinstance(action, dict):
+            discrete_action = int(action[self.d_key])
+            continuous_params = action[self.c_key]
+            
+            # Build the restored action with all parameter fields
+            restored = {self._type_key: discrete_action}
+            
+            # Add all parameter fields (fill unused ones with -1)
+            for param_idx in range(len(self._parameter_dims)):
+                param_dim = self._parameter_dims[param_idx]
+                if param_idx == discrete_action:
+                    # Use actual parameters for the selected action and denormalize
+                    normalized_params = continuous_params[:param_dim]
+                    # Denormalize from [-1, 1] to original range
+                    low = self._parameter_lows[param_idx]
+                    high = self._parameter_highs[param_idx]
+                    params = (normalized_params + 1) / 2 * (high - low) + low
+                else:
+                    # Fill unused parameters with original space's low values
+                    low = self._parameter_lows[param_idx]
+                    params = low.copy()  # Use low values instead of -1
+                
+                restored[f"{self._parameter_key}{param_idx}"] = params
+            
+            return restored
+        
+        # Restore batch of actions
+        else:
+            restored_actions = []
+            for a in action:
+                discrete_action = int(a[self.d_key])
+                continuous_params = a[self.c_key]
+                
+                # Build the restored action with all parameter fields
+                restored = {self._type_key: discrete_action}
+                
+                # Add all parameter fields (fill unused ones with -1)
+                for param_idx in range(len(self._parameter_dims)):
+                    param_dim = self._parameter_dims[param_idx]
+                    if param_idx == discrete_action:
+                        # Use actual parameters for the selected action and denormalize
+                        normalized_params = continuous_params[:param_dim]
+                        # Denormalize from [-1, 1] to original range
+                        low = self._parameter_lows[param_idx]
+                        high = self._parameter_highs[param_idx]
+                        params = (normalized_params + 1) / 2 * (high - low) + low
+                    else:
+                        # Fill unused parameters with original space's low values
+                        low = self._parameter_lows[param_idx]
+                        params = low.copy()  # Use low values instead of -1
+                    
+                    restored[f"{self._parameter_key}{param_idx}"] = params
+                
+                restored_actions.append(restored)
+            
+            return restored_actions
+
+
+# Alias for compatibility
+MlpPolicy = HybridSACPolicy

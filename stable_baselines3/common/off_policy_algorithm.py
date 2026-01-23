@@ -382,6 +382,9 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         if self.num_timesteps < learning_starts and not (self.use_sde and self.use_sde_at_warmup):
             # Warmup phase
             unscaled_action = np.array([self.action_space.sample() for _ in range(n_envs)])
+            if isinstance(self.action_space, spaces.Dict):
+                # Convert to dictionary of arrays
+                unscaled_action = {key: np.array([unscaled_action[i][key] for i in range(n_envs)]) for key in unscaled_action[0]}
         else:
             # Note: when using continuous actions,
             # we assume that the policy uses tanh to scale the action
@@ -400,6 +403,29 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             # We store the scaled action in the buffer
             buffer_action = scaled_action
             action = self.policy.unscale_action(scaled_action)
+        elif isinstance(self.action_space, spaces.Dict):
+            # Hybrid action case: handle Dict actions
+            # Scale and add noise to each Box action
+            scaled_action = {}
+            for key, act in unscaled_action.items():
+                if isinstance(self.action_space.spaces[key], spaces.Box):
+                    # Scale action
+                    scaled_action[key] = self.policy.scale_action(act, self.action_space.spaces[key])
+                    # Add noise
+                    if action_noise is not None:
+                        scaled_action[key] = np.clip(scaled_action[key] + action_noise(), -1, 1)
+                else:
+                    # Discrete case, keep action as-is
+                    scaled_action[key] = act
+
+            buffer_action = scaled_action
+            # Convert to array of dictionaries for vectorized environments
+            action = [{key: unscaled_action[key][i] for key in unscaled_action} for i in range(len(next(iter(unscaled_action.values()))))]
+            
+            # Restore the action to original format
+            if hasattr(self.policy, 'restore_action'):
+                action = self.policy.restore_action(action=action)
+            # else: keep action as-is for policies that don't need restoration
         else:
             # Discrete case, no need to normalize or clip
             buffer_action = unscaled_action
