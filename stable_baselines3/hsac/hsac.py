@@ -214,7 +214,7 @@ class HSAC(OffPolicyAlgorithm):
         # Target entropy for discrete actions (task policy)
         if self.target_entropy_task == "auto":
             # For discrete: -log(1/n) = log(n)
-            self.target_entropy_task = float(np.log(self.n_discrete_actions))
+            self.target_entropy_task = 0.1 * float(np.log(self.n_discrete_actions))
         else:
             self.target_entropy_task = float(self.target_entropy_task)
         
