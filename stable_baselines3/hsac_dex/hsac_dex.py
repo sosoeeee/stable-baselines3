@@ -108,6 +108,10 @@ class HSAC_DEX(HSAC):
             if self._demo_buffer is None:
                 raise RuntimeError("demo_path must be provided for HSAC_DEX")
             demo_obs, demo_actions = self._demo_buffer.sample(self.demo_batch_size)
+            # If environment observations are normalized (VecNormalize), apply same normalization
+            if getattr(self, "_vec_normalize_env", None) is not None:
+                # normalize_obs expects numpy arrays and does not update running stats
+                demo_obs = self._vec_normalize_env.normalize_obs(demo_obs)
             demo_obs_t = th.as_tensor(demo_obs, device=self.device)
             demo_ids = th.as_tensor(demo_actions["id"], device=self.device).long().flatten()
             demo_params = th.as_tensor(demo_actions["params"], device=self.device)
