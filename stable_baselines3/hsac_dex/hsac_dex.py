@@ -97,6 +97,8 @@ class HSAC_DEX(HSAC):
            返回 (batch,)
         2. 多对一: pred_params (batch, n_actions, param_dim), target_params (batch, param_dim)
            返回 (batch, n_actions)
+
+        self.demo_id_margin is the upper bound for the param distance.
         """
         # 判断是单对单还是多对一模式
         if pred_params.dim() == 2:  # (batch, param_dim)
@@ -113,8 +115,8 @@ class HSAC_DEX(HSAC):
             
             # pred_ids: (batch, n_actions), target_ids: (batch,) -> (batch, 1)
             id_mismatch = (pred_ids != target_ids.unsqueeze(1)).float() * self.demo_id_margin
-        
-        return param_dist + id_mismatch
+
+        return th.where(id_mismatch > 0, id_mismatch, param_dist)
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         self.policy.set_training_mode(True)
@@ -129,6 +131,9 @@ class HSAC_DEX(HSAC):
         ent_coef_task_losses, ent_coef_param_losses = [], []
         ent_coefs_task, ent_coefs_param = [], []
         actor_losses, critic_losses = [], []
+        
+        #debug
+        dist_losses = []
 
         # 使用 self._total_timesteps 作为归一化上限，确保线性衰减到0
         total_timesteps = getattr(self, '_total_timesteps', None)
@@ -274,6 +279,10 @@ class HSAC_DEX(HSAC):
             if gradient_step % self.target_update_interval == 0:
                 polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
 
+            #debug
+            dist_loss = (task_probs * demo_aux_weight_scaled * act_dist_all).sum(dim=1).mean()
+            dist_losses.append(dist_loss.item())
+
         self._n_updates += gradient_steps
 
         if hasattr(self, "logger"):
@@ -287,5 +296,6 @@ class HSAC_DEX(HSAC):
             if len(ent_coef_param_losses) > 0:
                 self.logger.record("train/ent_coef_param_loss", float(np.mean(ent_coef_param_losses)))
             self.logger.record("train/demo_aux_weight", demo_aux_weight_scaled)
-            self.logger.record("train/demo_k", self.demo_k)
-            self.logger.record("train/demo_id_margin", self.demo_id_margin)
+            self.logger.record("train/dist_loss", float(np.mean(dist_losses)) if dist_losses else 0.0)
+            # self.logger.record("train/demo_k", self.demo_k)
+            # self.logger.record("train/demo_id_margin", self.demo_id_margin)
