@@ -58,7 +58,8 @@ class HSAC_DEX(HSAC):
         k = min(self.demo_k, obs_demo.shape[0])
         obs_norm = (obs ** 2).sum(dim=1, keepdim=True)
         demo_norm = demo_norm if demo_norm is not None else (obs_demo ** 2).sum(dim=1, keepdim=True).T
-        l2_pair = obs_norm + demo_norm - 2.0 * (obs @ obs_demo.T)
+        l2_pair_squared = obs_norm + demo_norm - 2.0 * (obs @ obs_demo.T)
+        l2_pair = th.sqrt(th.clamp(l2_pair_squared, min=1e-8))  # 欧式距离而非平方
         topk_values, topk_indices = l2_pair.topk(k, dim=1, largest=False)
         topk_weights = F.softmax(-topk_values, dim=1)
 
@@ -102,16 +103,14 @@ class HSAC_DEX(HSAC):
         """
         # 判断是单对单还是多对一模式
         if pred_params.dim() == 2:  # (batch, param_dim)
-            # 单对单模式
-            param_dim = max(1, target_params.shape[1])
-            param_dist = ((pred_params - target_params).pow(2).sum(dim=1) / param_dim)
+            # 单对单模式: 计算标准欧式距离
+            param_dist = th.sqrt((pred_params - target_params).pow(2).sum(dim=1))
             id_mismatch = (pred_ids != target_ids).float() * self.demo_id_margin
         else:  # pred_params.dim() == 3: (batch, n_actions, param_dim)
-            # 多对一模式: 为每个离散动作计算距离
-            param_dim = max(1, target_params.shape[1])
+            # 多对一模式: 为每个离散动作计算标准欧式距离
             # target_params: (batch, param_dim) -> (batch, 1, param_dim)
             param_diff = pred_params - target_params.unsqueeze(1)
-            param_dist = (param_diff ** 2).sum(dim=2) / param_dim  # (batch, n_actions)
+            param_dist = th.sqrt((param_diff ** 2).sum(dim=2))  # (batch, n_actions)
             
             # pred_ids: (batch, n_actions), target_ids: (batch,) -> (batch, 1)
             id_mismatch = (pred_ids != target_ids.unsqueeze(1)).float() * self.demo_id_margin
