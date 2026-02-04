@@ -54,7 +54,7 @@ class HSAC_DEX(HSAC):
         demo_ids: th.Tensor,
         demo_params: th.Tensor,
         demo_norm: Optional[th.Tensor] = None,
-    ) -> Tuple[th.Tensor, th.Tensor]:
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         k = min(self.demo_k, obs_demo.shape[0])
         obs_norm = (obs ** 2).sum(dim=1, keepdim=True)
         demo_norm = demo_norm if demo_norm is not None else (obs_demo ** 2).sum(dim=1, keepdim=True).T
@@ -62,6 +62,27 @@ class HSAC_DEX(HSAC):
         l2_pair = th.sqrt(th.clamp(l2_pair_squared, min=1e-8))  # 欧式距离而非平方
         topk_values, topk_indices = l2_pair.topk(k, dim=1, largest=False)
         topk_weights = F.softmax(-topk_values, dim=1)
+
+        #debug (convert to numpy)
+        # try:
+        #     # 选择要打印的obs数量
+        #     num_obs_to_print = min(3, obs.shape[0])
+
+        #     # 转换为numpy
+        #     obs_np = obs.cpu().numpy()
+        #     demo_obs_np = obs_demo.cpu().numpy()
+        #     topk_indices_np = topk_indices.cpu().numpy()
+
+        #     for i in range(num_obs_to_print):
+        #         nearest_demo_indices = topk_indices_np[i]
+        #         nearest_demo_obs = demo_obs_np[nearest_dWemo_indices]
+        #         dist_diff = obs_np[i] - nearest_demo_obs
+
+        #     print(dist_diff)
+
+        # except Exception as e:
+        #     print(f"Debug output failed: {e}")
+        
 
         topk_ids = demo_ids[topk_indices]  # (batch, k)
         topk_params = demo_params[topk_indices]  # (batch, k, param_dim)
@@ -81,7 +102,7 @@ class HSAC_DEX(HSAC):
         weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)
         prop_params = (weights.unsqueeze(-1) * topk_params).sum(dim=1)
 
-        return prop_ids, prop_params
+        return prop_ids, prop_params, topk_values
 
     def _hybrid_act_dist(
         self,
@@ -133,6 +154,7 @@ class HSAC_DEX(HSAC):
         
         #debug
         dist_losses = []
+        topk_dist_means = []
 
         # 使用 self._total_timesteps 作为归一化上限，确保线性衰减到0
         total_timesteps = getattr(self, '_total_timesteps', None)
@@ -201,7 +223,7 @@ class HSAC_DEX(HSAC):
                 next_q_values = next_q_values - ent_coef_task * next_discrete_log_prob.reshape(-1, 1)
                 next_q_values = next_q_values - ent_coef_param * next_continuous_log_prob.reshape(-1, 1)
 
-                prop_ids, prop_params = self._compute_propagated_actions(
+                prop_ids, prop_params, _ = self._compute_propagated_actions(
                     replay_data.next_observations, demo_obs_t, demo_ids, demo_params, demo_norm
                 )
                 act_dist = self._hybrid_act_dist(
@@ -244,9 +266,10 @@ class HSAC_DEX(HSAC):
             all_q_values = all_q_values.squeeze(-1)
 
             # 计算传播的演示动作: (a^e, x^e)
-            prop_ids, prop_params = self._compute_propagated_actions(
+            prop_ids, prop_params, topk_values = self._compute_propagated_actions(
                 replay_data.observations, demo_obs_t, demo_ids, demo_params, demo_norm
             )
+            topk_dist_means.append(topk_values.mean().item())
             
             # 为每个离散动作a计算 d((a,x̃), (a^e,x^e))
             # all_continuous_actions: (batch, n_actions, param_dim)
@@ -296,5 +319,6 @@ class HSAC_DEX(HSAC):
                 self.logger.record("train/ent_coef_param_loss", float(np.mean(ent_coef_param_losses)))
             self.logger.record("train/demo_aux_weight", demo_aux_weight_scaled)
             self.logger.record("train/dist_loss", float(np.mean(dist_losses)) if dist_losses else 0.0)
+            self.logger.record("train/topk_dist_mean", float(np.mean(topk_dist_means)) if topk_dist_means else 0.0)
             # self.logger.record("train/demo_k", self.demo_k)
             # self.logger.record("train/demo_id_margin", self.demo_id_margin)
