@@ -9,6 +9,7 @@ from torch.nn import functional as F
 
 from stable_baselines3.hsac import HSAC
 from stable_baselines3.common.utils import polyak_update
+from stable_baselines3.common.type_aliases import HybridDictReplayBufferSamples
 from stable_baselines3.hsac_dex.demo_buffer import DemoBuffer
 
 
@@ -21,6 +22,7 @@ class HSAC_DEX(HSAC):
         demo_path: Optional[str] = None,
         demo_batch_size: int = 256,
         demo_aux_weight: float = 1.0,
+        replay_demo_ratio: float = 0.0,
         demo_k: int = 5,
         demo_id_margin: float = 1.0,
         demo_dist_threshold: float = 2.0,
@@ -29,6 +31,7 @@ class HSAC_DEX(HSAC):
         self.demo_path = demo_path
         self.demo_batch_size = demo_batch_size
         self.demo_aux_weight = demo_aux_weight
+        self.replay_demo_ratio = replay_demo_ratio
         self.demo_k = demo_k
         self.demo_id_margin = demo_id_margin
         self.demo_dist_threshold = demo_dist_threshold
@@ -192,6 +195,33 @@ class HSAC_DEX(HSAC):
 
         return th.where(id_mismatch > 0, id_mismatch, param_dist)
 
+    def _concat_replay_samples(
+        self,
+        first: HybridDictReplayBufferSamples,
+        second: HybridDictReplayBufferSamples,
+    ) -> HybridDictReplayBufferSamples:
+        observations = {
+            key: th.cat([first.observations[key], second.observations[key]], dim=0)
+            for key in first.observations.keys()
+        }
+        actions = {
+            key: th.cat([first.actions[key], second.actions[key]], dim=0)
+            for key in first.actions.keys()
+        }
+        next_observations = {
+            key: th.cat([first.next_observations[key], second.next_observations[key]], dim=0)
+            for key in first.next_observations.keys()
+        }
+        dones = th.cat([first.dones, second.dones], dim=0)
+        rewards = th.cat([first.rewards, second.rewards], dim=0)
+        return HybridDictReplayBufferSamples(
+            observations=observations,
+            actions=actions,
+            next_observations=next_observations,
+            dones=dones,
+            rewards=rewards,
+        )
+
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         self.policy.set_training_mode(True)
         # Update optimizers learning rate (actor/critic + entropy coeffs)
@@ -221,7 +251,24 @@ class HSAC_DEX(HSAC):
         demo_aux_weight_scaled = self.demo_aux_weight * decay_coef
 
         for gradient_step in range(gradient_steps):
-            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
+            demo_ratio = float(np.clip(self.replay_demo_ratio, 0.0, 1.0))
+            demo_replay_batch = int(round(batch_size * demo_ratio))
+            replay_batch = batch_size - demo_replay_batch
+
+            if demo_replay_batch > 0 and self._demo_buffer is None:
+                raise RuntimeError("demo_path must be provided when replay_demo_ratio > 0")
+
+            if replay_batch > 0:
+                replay_part = self.replay_buffer.sample(replay_batch, env=self._vec_normalize_env)  # type: ignore[union-attr]
+            if demo_replay_batch > 0:
+                demo_part = self._demo_buffer.sample(demo_replay_batch, env=self._vec_normalize_env)
+
+            if replay_batch == 0:
+                replay_data = demo_part
+            elif demo_replay_batch == 0:
+                replay_data = replay_part
+            else:
+                replay_data = self._concat_replay_samples(replay_part, demo_part)
 
             if self._demo_buffer is None:
                 raise RuntimeError("demo_path must be provided for HSAC_DEX")
