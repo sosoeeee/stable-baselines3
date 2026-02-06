@@ -11,7 +11,7 @@ import torch as th
 from gymnasium import spaces
 
 from stable_baselines3.common.base_class import BaseAlgorithm
-from stable_baselines3.common.buffers import DictReplayBuffer, ReplayBuffer
+from stable_baselines3.common.buffers import DictReplayBuffer, HybridDictReplayBuffer, HybridReplayBuffer, ReplayBuffer
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.noise import ActionNoise, VectorizedActionNoise
 from stable_baselines3.common.policies import BasePolicy
@@ -19,7 +19,7 @@ from stable_baselines3.common.save_util import load_from_pkl, save_to_pkl
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, RolloutReturn, Schedule, TrainFreq, TrainFrequencyUnit
 from stable_baselines3.common.utils import safe_mean, should_collect_more_steps
 from stable_baselines3.common.vec_env import VecEnv
-from stable_baselines3.her.her_replay_buffer import HerReplayBuffer
+from stable_baselines3.her.her_replay_buffer import HerReplayBuffer, HybridHerReplayBuffer
 
 SelfOffPolicyAlgorithm = TypeVar("SelfOffPolicyAlgorithm", bound="OffPolicyAlgorithm")
 
@@ -174,8 +174,13 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         self.set_random_seed(self.seed)
 
         if self.replay_buffer_class is None:
-            if isinstance(self.observation_space, spaces.Dict):
+            # Automatically select appropriate buffer class based on observation and action spaces
+            if isinstance(self.observation_space, spaces.Dict) and isinstance(self.action_space, spaces.Dict):
+                self.replay_buffer_class = HybridDictReplayBuffer
+            elif isinstance(self.observation_space, spaces.Dict):
                 self.replay_buffer_class = DictReplayBuffer
+            elif isinstance(self.action_space, spaces.Dict):
+                self.replay_buffer_class = HybridReplayBuffer
             else:
                 self.replay_buffer_class = ReplayBuffer
 
@@ -183,9 +188,12 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             # Make a local copy as we should not pickle
             # the environment when using HerReplayBuffer
             replay_buffer_kwargs = self.replay_buffer_kwargs.copy()
-            if issubclass(self.replay_buffer_class, HerReplayBuffer):
-                assert self.env is not None, "You must pass an environment when using `HerReplayBuffer`"
-                replay_buffer_kwargs["env"] = self.env
+            # Check if it's HerReplayBuffer or HybridHerReplayBuffer
+            if issubclass(self.replay_buffer_class, (HerReplayBuffer, HybridHerReplayBuffer)):
+                assert self.env is not None, (
+                    "You must pass an environment when using `HerReplayBuffer` or `HybridHerReplayBuffer`"
+                )
+            replay_buffer_kwargs["env"] = self.env
             self.replay_buffer = self.replay_buffer_class(
                 self.buffer_size,
                 self.observation_space,
@@ -240,7 +248,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             self.replay_buffer.handle_timeout_termination = False
             self.replay_buffer.timeouts = np.zeros_like(self.replay_buffer.dones)
 
-        if isinstance(self.replay_buffer, HerReplayBuffer):
+        if isinstance(self.replay_buffer, (HerReplayBuffer, HybridHerReplayBuffer)):
             assert self.env is not None, "You must pass an environment at load time when using `HerReplayBuffer`"
             self.replay_buffer.set_env(self.env)
             if truncate_last_traj:

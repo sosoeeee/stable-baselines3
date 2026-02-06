@@ -12,7 +12,7 @@ from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
-from stable_baselines3.hsac.policies import HybridActor, HybridCritic, HybridSACPolicy, MlpPolicy
+from stable_baselines3.hsac.policies import HybridActor, HybridCritic, HybridSACPolicy, MlpPolicy, MultiInputPolicy
 from stable_baselines3.common.buffers import HybridReplayBuffer
 
 SelfHSAC = TypeVar("SelfHSAC", bound="HSAC")
@@ -59,6 +59,7 @@ class HSAC(OffPolicyAlgorithm):
 
     policy_aliases: ClassVar[Dict[str, Type[BasePolicy]]] = {
         "MlpPolicy": MlpPolicy,
+        "MultiInputPolicy": MultiInputPolicy,
     }
     policy: HybridSACPolicy
     actor: HybridActor

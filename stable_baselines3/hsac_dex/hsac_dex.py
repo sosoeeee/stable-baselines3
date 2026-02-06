@@ -36,16 +36,48 @@ class HSAC_DEX(HSAC):
     def _setup_model(self) -> None:
         super()._setup_model()
         if self.demo_path is not None:
-            self._demo_buffer = DemoBuffer.from_npz(self.demo_path, self.device)
-
-    # def _deterministic_action(self, actor, obs: th.Tensor) -> dict:
-    #     logits = actor.get_task_dist_params(obs)
-    #     discrete_action = th.argmax(logits, dim=1)
-    #     mean_actions, log_std, kwargs = actor.get_param_dist_params(obs, discrete_action)
-    #     continuous_action = actor.param_action_dist.actions_from_params(
-    #         mean_actions, log_std, deterministic=True, **kwargs
-    #     )
-    #     return {self.d_key: discrete_action, self.c_key: continuous_action}
+            self._demo_buffer = DemoBuffer.from_npz(
+                path=self.demo_path,
+                observation_space=self.observation_space,
+                action_space=self.action_space,
+                device=self.device,
+                n_envs=1,
+            )
+            
+            # Load demonstration data into replay buffer
+            print(f"\nLoading {self._demo_buffer.size()} demonstrations into replay buffer...")
+            demo_size = self._demo_buffer.size()
+            
+            # Transfer all demo data to replay buffer
+            for i in range(demo_size):
+                # Get data from demo buffer at position i
+                obs_dict = {
+                    key: self._demo_buffer.observations[key][i, 0]  # [i, env_idx=0]
+                    for key in self._demo_buffer.observations.keys()
+                }
+                next_obs_dict = {
+                    key: self._demo_buffer.next_observations[key][i, 0]
+                    for key in self._demo_buffer.next_observations.keys()
+                }
+                action_dict = {
+                    key: self._demo_buffer.actions[key][i, 0]
+                    for key in self._demo_buffer.actions.keys()
+                }
+                reward = self._demo_buffer.rewards[i, 0]
+                done = self._demo_buffer.dones[i, 0]
+                
+                # Add to replay buffer
+                self.replay_buffer.add(
+                    obs_dict,
+                    next_obs_dict,
+                    action_dict,
+                    reward,
+                    done,
+                    [{}]  # infos
+                )
+            
+            print(f"✓ Successfully loaded {demo_size} demonstrations into replay buffer")
+            print(f"  Replay buffer now contains {self.replay_buffer.size()} transitions\n")
 
     def _compute_propagated_actions(
         self,
@@ -169,14 +201,24 @@ class HSAC_DEX(HSAC):
 
             if self._demo_buffer is None:
                 raise RuntimeError("demo_path must be provided for HSAC_DEX")
-            demo_obs, demo_actions = self._demo_buffer.sample(self.demo_batch_size)
-            # If environment observations are normalized (VecNormalize), apply same normalization
-            if getattr(self, "_vec_normalize_env", None) is not None:
-                # normalize_obs expects numpy arrays and does not update running stats
-                demo_obs = self._vec_normalize_env.normalize_obs(demo_obs)
-            demo_obs_t = th.as_tensor(demo_obs, device=self.device, dtype=th.float32)
-            demo_ids = th.as_tensor(demo_actions["id"], device=self.device).long().flatten()
-            demo_params = th.as_tensor(demo_actions["params"], device=self.device, dtype=th.float32)
+
+            # Sample from demo buffer (returns HybridDictReplayBufferSamples)
+            demo_data = self._demo_buffer.sample(batch_size, env=self._vec_normalize_env)
+            
+            # Extract observation tensor (use 'observation' key from dict)
+            demo_obs_t = demo_data.observations["observation"]
+            
+            # Extract action components
+            demo_ids = demo_data.actions["id"].long().flatten()
+            
+            # Concatenate all param keys to reconstruct full params
+            param_keys = sorted([k for k in demo_data.actions.keys() if k.startswith("params")])
+            if param_keys:
+                demo_params = th.cat([demo_data.actions[k] for k in param_keys], dim=-1)
+            else:
+                demo_params = th.zeros((batch_size, 0), device=self.device, dtype=th.float32)
+            
+            # Precompute demo observation norm for efficiency
             demo_norm = (demo_obs_t ** 2).sum(dim=1, keepdim=True).T
 
             # Current actions and log probs from actor (for entropy terms)
@@ -224,7 +266,7 @@ class HSAC_DEX(HSAC):
                 next_q_values = next_q_values - ent_coef_param * next_continuous_log_prob.reshape(-1, 1)
 
                 prop_ids, prop_params, _ = self._compute_propagated_actions(
-                    replay_data.next_observations, demo_obs_t, demo_ids, demo_params, demo_norm
+                    replay_data.next_observations["observation"], demo_obs_t, demo_ids, demo_params, demo_norm
                 )
                 act_dist = self._hybrid_act_dist(
                     next_actions[self.d_key], next_actions[self.c_key], prop_ids, prop_params
@@ -267,7 +309,7 @@ class HSAC_DEX(HSAC):
 
             # 计算传播的演示动作: (a^e, x^e)
             prop_ids, prop_params, topk_values = self._compute_propagated_actions(
-                replay_data.observations, demo_obs_t, demo_ids, demo_params, demo_norm
+                replay_data.observations["observation"], demo_obs_t, demo_ids, demo_params, demo_norm
             )
             topk_dist_means.append(topk_values.mean().item())
             

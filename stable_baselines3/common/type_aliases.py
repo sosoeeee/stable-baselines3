@@ -86,6 +86,14 @@ class HybridReplayBufferSamples(NamedTuple):
     rewards: th.Tensor
 
 
+class HybridDictReplayBufferSamples(NamedTuple):
+    observations: TensorDict
+    actions: TensorDict
+    next_observations: TensorDict
+    dones: th.Tensor
+    rewards: th.Tensor
+
+
 class RolloutReturn(NamedTuple):
     episode_timesteps: int
     n_episodes: int
