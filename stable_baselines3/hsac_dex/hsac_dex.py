@@ -36,48 +36,54 @@ class HSAC_DEX(HSAC):
     def _setup_model(self) -> None:
         super()._setup_model()
         if self.demo_path is not None:
+            # 创建 demo_buffer，使用与 replay_buffer 相同的 n_envs
             self._demo_buffer = DemoBuffer.from_npz(
                 path=self.demo_path,
                 observation_space=self.observation_space,
                 action_space=self.action_space,
                 device=self.device,
-                n_envs=1,
+                n_envs=self.n_envs,  # 使用相同的 n_envs
             )
             
-            # Load demonstration data into replay buffer
-            print(f"\nLoading {self._demo_buffer.size()} demonstrations into replay buffer...")
-            demo_size = self._demo_buffer.size()
+            self.demo_batch_size = min(self.demo_batch_size, self._demo_buffer.size())
+
+            # 将 demo_buffer 的数据复制到 replay_buffer
+            # 现在两者的 n_envs 一致，可以直接复制内部数组
+            print(f"\nCopying demo data to replay buffer...")
+            print(f"  Demo buffer size: {self._demo_buffer.size()}, pos: {self._demo_buffer.pos}")
+            print(f"  Replay buffer capacity: {self.replay_buffer.buffer_size}")
             
-            # Transfer all demo data to replay buffer
-            for i in range(demo_size):
-                # Get data from demo buffer at position i
-                obs_dict = {
-                    key: self._demo_buffer.observations[key][i, 0]  # [i, env_idx=0]
-                    for key in self._demo_buffer.observations.keys()
-                }
-                next_obs_dict = {
-                    key: self._demo_buffer.next_observations[key][i, 0]
-                    for key in self._demo_buffer.next_observations.keys()
-                }
-                action_dict = {
-                    key: self._demo_buffer.actions[key][i, 0]
-                    for key in self._demo_buffer.actions.keys()
-                }
-                reward = self._demo_buffer.rewards[i, 0]
-                done = self._demo_buffer.dones[i, 0]
-                
-                # Add to replay buffer
-                self.replay_buffer.add(
-                    obs_dict,
-                    next_obs_dict,
-                    action_dict,
-                    reward,
-                    done,
-                    [{}]  # infos
-                )
+            demo_size = self._demo_buffer.pos  # 实际填充的位置
             
-            print(f"✓ Successfully loaded {demo_size} demonstrations into replay buffer")
-            print(f"  Replay buffer now contains {self.replay_buffer.size()} transitions\n")
+            # 确保 replay_buffer 有足够空间
+            if demo_size > self.replay_buffer.buffer_size:
+                print(f"Warning: Demo size ({demo_size}) exceeds replay buffer size ({self.replay_buffer.buffer_size})")
+                demo_size = self.replay_buffer.buffer_size
+            
+            # 直接复制内部数组（高效）
+            for key in self.replay_buffer.observations.keys():
+                self.replay_buffer.observations[key][:demo_size] = \
+                    self._demo_buffer.observations[key][:demo_size].copy()
+                self.replay_buffer.next_observations[key][:demo_size] = \
+                    self._demo_buffer.next_observations[key][:demo_size].copy()
+            
+            for key in self.replay_buffer.actions.keys():
+                self.replay_buffer.actions[key][:demo_size] = \
+                    self._demo_buffer.actions[key][:demo_size].copy()
+            
+            self.replay_buffer.rewards[:demo_size] = self._demo_buffer.rewards[:demo_size].copy()
+            self.replay_buffer.dones[:demo_size] = self._demo_buffer.dones[:demo_size].copy()
+            
+            if self.replay_buffer.handle_timeout_termination:
+                self.replay_buffer.timeouts[:demo_size] = 0.0
+            
+            # 更新 replay_buffer 的位置
+            self.replay_buffer.pos = demo_size
+            self.replay_buffer.full = (demo_size >= self.replay_buffer.buffer_size)
+            
+            print(f"✓ Successfully copied {demo_size} demo transitions to replay buffer")
+            print(f"  Replay buffer now: pos={self.replay_buffer.pos}, size={self.replay_buffer.size()}\n")
+
 
     def _compute_propagated_actions(
         self,
@@ -85,13 +91,22 @@ class HSAC_DEX(HSAC):
         obs_demo: th.Tensor,
         demo_ids: th.Tensor,
         demo_params: th.Tensor,
-        demo_norm: Optional[th.Tensor] = None,
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        # Ensure 2D feature tensors so cdist/topk stays consistent
+        if obs.dim() > 2:
+            obs = obs.reshape(obs.shape[0], -1)
+        if obs_demo.dim() > 2:
+            obs_demo = obs_demo.reshape(obs_demo.shape[0], -1)
+
+        # Flatten demo id/params to match demo batch dimension
+        if demo_ids.dim() > 1:
+            demo_ids = demo_ids.squeeze(-1)
+        demo_ids = demo_ids.long()
+        if demo_params.dim() > 2:
+            demo_params = demo_params.reshape(demo_params.shape[0], -1)
+
         k = min(self.demo_k, obs_demo.shape[0])
-        obs_norm = (obs ** 2).sum(dim=1, keepdim=True)
-        demo_norm = demo_norm if demo_norm is not None else (obs_demo ** 2).sum(dim=1, keepdim=True).T
-        l2_pair_squared = obs_norm + demo_norm - 2.0 * (obs @ obs_demo.T)
-        l2_pair = th.sqrt(th.clamp(l2_pair_squared, min=1e-8))  # 欧式距离而非平方
+        l2_pair = th.cdist(obs, obs_demo)
         topk_values, topk_indices = l2_pair.topk(k, dim=1, largest=False)
         topk_weights = F.softmax(-topk_values, dim=1)
 
@@ -203,23 +218,14 @@ class HSAC_DEX(HSAC):
                 raise RuntimeError("demo_path must be provided for HSAC_DEX")
 
             # Sample from demo buffer (returns HybridDictReplayBufferSamples)
-            demo_data = self._demo_buffer.sample(batch_size, env=self._vec_normalize_env)
+            demo_data = self._demo_buffer.sample(self.demo_batch_size, env=self._vec_normalize_env)
             
             # Extract observation tensor (use 'observation' key from dict)
             demo_obs_t = demo_data.observations["observation"]
             
             # Extract action components
-            demo_ids = demo_data.actions["id"].long().flatten()
-            
-            # Concatenate all param keys to reconstruct full params
-            param_keys = sorted([k for k in demo_data.actions.keys() if k.startswith("params")])
-            if param_keys:
-                demo_params = th.cat([demo_data.actions[k] for k in param_keys], dim=-1)
-            else:
-                demo_params = th.zeros((batch_size, 0), device=self.device, dtype=th.float32)
-            
-            # Precompute demo observation norm for efficiency
-            demo_norm = (demo_obs_t ** 2).sum(dim=1, keepdim=True).T
+            demo_ids = demo_data.actions["discrete"]
+            demo_params = demo_data.actions["continuous"]
 
             # Current actions and log probs from actor (for entropy terms)
             actions_pi, discrete_log_prob, continuous_log_prob = self.actor.action_log_prob(replay_data.observations)
@@ -266,7 +272,7 @@ class HSAC_DEX(HSAC):
                 next_q_values = next_q_values - ent_coef_param * next_continuous_log_prob.reshape(-1, 1)
 
                 prop_ids, prop_params, _ = self._compute_propagated_actions(
-                    replay_data.next_observations["observation"], demo_obs_t, demo_ids, demo_params, demo_norm
+                    replay_data.next_observations["observation"], demo_obs_t, demo_ids, demo_params
                 )
                 act_dist = self._hybrid_act_dist(
                     next_actions[self.d_key], next_actions[self.c_key], prop_ids, prop_params
@@ -309,7 +315,7 @@ class HSAC_DEX(HSAC):
 
             # 计算传播的演示动作: (a^e, x^e)
             prop_ids, prop_params, topk_values = self._compute_propagated_actions(
-                replay_data.observations["observation"], demo_obs_t, demo_ids, demo_params, demo_norm
+                replay_data.observations["observation"], demo_obs_t, demo_ids, demo_params
             )
             topk_dist_means.append(topk_values.mean().item())
             
