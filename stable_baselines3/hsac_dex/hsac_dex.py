@@ -23,6 +23,7 @@ class HSAC_DEX(HSAC):
         demo_aux_weight: float = 1.0,
         demo_k: int = 5,
         demo_id_margin: float = 1.0,
+        demo_dist_threshold: float = 2.0,
         **kwargs,
     ):
         self.demo_path = demo_path
@@ -30,6 +31,7 @@ class HSAC_DEX(HSAC):
         self.demo_aux_weight = demo_aux_weight
         self.demo_k = demo_k
         self.demo_id_margin = demo_id_margin
+        self.demo_dist_threshold = demo_dist_threshold
         self._demo_buffer: Optional[DemoBuffer] = None
         super().__init__(*args, **kwargs)
 
@@ -91,7 +93,7 @@ class HSAC_DEX(HSAC):
         obs_demo: th.Tensor,
         demo_ids: th.Tensor,
         demo_params: th.Tensor,
-    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
         # Ensure 2D feature tensors so cdist/topk stays consistent
         if obs.dim() > 2:
             obs = obs.reshape(obs.shape[0], -1)
@@ -109,6 +111,11 @@ class HSAC_DEX(HSAC):
         l2_pair = th.cdist(obs, obs_demo)
         topk_values, topk_indices = l2_pair.topk(k, dim=1, largest=False)
         topk_weights = F.softmax(-topk_values, dim=1)
+
+        # Compute validity mask: max distance among k nearest neighbors < threshold
+        # topk_values: (batch, k), take max along k dimension
+        max_topk_dist = topk_values.max(dim=1)[0]  # (batch,)
+        valid_mask = max_topk_dist < self.demo_dist_threshold  # (batch,)
 
         #debug (convert to numpy)
         # try:
@@ -149,7 +156,7 @@ class HSAC_DEX(HSAC):
         weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)
         prop_params = (weights.unsqueeze(-1) * topk_params).sum(dim=1)
 
-        return prop_ids, prop_params, topk_values
+        return prop_ids, prop_params, topk_values, valid_mask
 
     def _hybrid_act_dist(
         self,
@@ -202,6 +209,8 @@ class HSAC_DEX(HSAC):
         #debug
         dist_losses = []
         topk_dist_means = []
+        valid_ratios = []
+        max_dists = []
 
         # 使用 self._total_timesteps 作为归一化上限，确保线性衰减到0
         total_timesteps = getattr(self, '_total_timesteps', None)
@@ -271,14 +280,16 @@ class HSAC_DEX(HSAC):
                 next_q_values = next_q_values - ent_coef_task * next_discrete_log_prob.reshape(-1, 1)
                 next_q_values = next_q_values - ent_coef_param * next_continuous_log_prob.reshape(-1, 1)
 
-                prop_ids, prop_params, _ = self._compute_propagated_actions(
+                prop_ids, prop_params, _, valid_mask = self._compute_propagated_actions(
                     replay_data.next_observations["observation"], demo_obs_t, demo_ids, demo_params
                 )
                 act_dist = self._hybrid_act_dist(
                     next_actions[self.d_key], next_actions[self.c_key], prop_ids, prop_params
                 )
                 if demo_aux_weight_scaled > 0:
-                    next_q_values = next_q_values - demo_aux_weight_scaled * act_dist.unsqueeze(1)
+                    # Apply mask: only penalize similar states
+                    masked_dist = act_dist * valid_mask.float()
+                    next_q_values = next_q_values - demo_aux_weight_scaled * masked_dist.unsqueeze(1)
 
                 target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
 
@@ -314,10 +325,12 @@ class HSAC_DEX(HSAC):
             all_q_values = all_q_values.squeeze(-1)
 
             # 计算传播的演示动作: (a^e, x^e)
-            prop_ids, prop_params, topk_values = self._compute_propagated_actions(
+            prop_ids, prop_params, topk_values, valid_mask = self._compute_propagated_actions(
                 replay_data.observations["observation"], demo_obs_t, demo_ids, demo_params
             )
             topk_dist_means.append(topk_values.mean().item())
+            valid_ratios.append(valid_mask.float().mean().item())
+            max_dists.append(topk_values.max(dim=1)[0].mean().item())
             
             # 为每个离散动作a计算 d((a,x̃), (a^e,x^e))
             # all_continuous_actions: (batch, n_actions, param_dim)
@@ -330,12 +343,15 @@ class HSAC_DEX(HSAC):
             act_dist_all = self._hybrid_act_dist(
                 all_discrete_actions, all_continuous_actions, prop_ids, prop_params
             )
+            
+            # Apply mask: (batch, n_actions) * (batch, 1) -> (batch, n_actions)
+            masked_dist_all = act_dist_all * valid_mask.unsqueeze(1).float()
 
             # 计算加权损失: L_π = E[Σ_a π_tsk(a|s)[...]]
             weighted_loss = task_probs * (
                 ent_coef_task * task_log_probs +
                 ent_coef_param * all_continuous_log_probs +
-                demo_aux_weight_scaled * act_dist_all -
+                demo_aux_weight_scaled * masked_dist_all -
                 all_q_values
             )
             # Σ_a: 对所有离散动作求和; E: 对batch求均值
@@ -350,7 +366,7 @@ class HSAC_DEX(HSAC):
                 polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
 
             #debug
-            dist_loss = (task_probs * demo_aux_weight_scaled * act_dist_all).sum(dim=1).mean()
+            dist_loss = (task_probs * demo_aux_weight_scaled * masked_dist_all).sum(dim=1).mean()
             dist_losses.append(dist_loss.item())
 
         self._n_updates += gradient_steps
@@ -368,5 +384,7 @@ class HSAC_DEX(HSAC):
             self.logger.record("train/demo_aux_weight", demo_aux_weight_scaled)
             self.logger.record("train/dist_loss", float(np.mean(dist_losses)) if dist_losses else 0.0)
             self.logger.record("train/topk_dist_mean", float(np.mean(topk_dist_means)) if topk_dist_means else 0.0)
+            self.logger.record("train/valid_demo_ratio", float(np.mean(valid_ratios)) if valid_ratios else 0.0)
+            self.logger.record("train/max_topk_dist", float(np.mean(max_dists)) if max_dists else 0.0)
             # self.logger.record("train/demo_k", self.demo_k)
             # self.logger.record("train/demo_id_margin", self.demo_id_margin)
