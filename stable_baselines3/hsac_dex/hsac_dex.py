@@ -52,41 +52,54 @@ class HSAC_DEX(HSAC):
             
             self.demo_batch_size = min(self.demo_batch_size, self._demo_buffer.size())
 
-            # 将 demo_buffer 的数据复制到 replay_buffer
-            # 现在两者的 n_envs 一致，可以直接复制内部数组
-            print(f"\nCopying demo data to replay buffer...")
+            # 使用 replay_buffer.add() 写入，确保 HER 相关的 ep_start/ep_length/_current_ep_start 被更新
+            print(f"\nLoading demo data into replay buffer via add()...")
             print(f"  Demo buffer size: {self._demo_buffer.size()}, pos: {self._demo_buffer.pos}")
             print(f"  Replay buffer capacity: {self.replay_buffer.buffer_size}")
-            
-            demo_size = self._demo_buffer.pos  # 实际填充的位置
-            
-            # 确保 replay_buffer 有足够空间
+
+            demo_dones = self._demo_buffer.dones
+            per_env_lengths = []
+            for env_idx in range(self.n_envs):
+                done_indices = np.flatnonzero(demo_dones[:, env_idx] > 0)
+                if len(done_indices) == 0:
+                    per_env_lengths.append(0)
+                else:
+                    per_env_lengths.append(int(done_indices[-1]) + 1)
+
+            demo_size = min(per_env_lengths) if per_env_lengths else 0
+            max_env_size = max(per_env_lengths) if per_env_lengths else 0
+
+            if demo_size == 0:
+                print("Warning: No complete demo episodes found to load into replay buffer.")
+            if demo_size < max_env_size:
+                print(
+                    "Warning: Demo lengths differ across envs. "
+                    f"Truncating to {demo_size} steps per env to keep add() consistent."
+                )
+
             if demo_size > self.replay_buffer.buffer_size:
-                print(f"Warning: Demo size ({demo_size}) exceeds replay buffer size ({self.replay_buffer.buffer_size})")
+                print(
+                    f"Warning: Demo size ({demo_size}) exceeds replay buffer size ({self.replay_buffer.buffer_size})"
+                )
                 demo_size = self.replay_buffer.buffer_size
-            
-            # 直接复制内部数组（高效）
-            for key in self.replay_buffer.observations.keys():
-                self.replay_buffer.observations[key][:demo_size] = \
-                    self._demo_buffer.observations[key][:demo_size].copy()
-                self.replay_buffer.next_observations[key][:demo_size] = \
-                    self._demo_buffer.next_observations[key][:demo_size].copy()
-            
-            for key in self.replay_buffer.actions.keys():
-                self.replay_buffer.actions[key][:demo_size] = \
-                    self._demo_buffer.actions[key][:demo_size].copy()
-            
-            self.replay_buffer.rewards[:demo_size] = self._demo_buffer.rewards[:demo_size].copy()
-            self.replay_buffer.dones[:demo_size] = self._demo_buffer.dones[:demo_size].copy()
-            
-            if self.replay_buffer.handle_timeout_termination:
-                self.replay_buffer.timeouts[:demo_size] = 0.0
-            
-            # 更新 replay_buffer 的位置
-            self.replay_buffer.pos = demo_size
-            self.replay_buffer.full = (demo_size >= self.replay_buffer.buffer_size)
-            
-            print(f"✓ Successfully copied {demo_size} demo transitions to replay buffer")
+
+            # change the truncated transitions at demo_size to have done=True
+            # so that HER won't sample beyond the truncated length
+            self._demo_buffer.dones[demo_size - 1, :] = 1
+
+            infos = [{} for _ in range(self.n_envs)]
+            for t in range(demo_size):
+                obs = {key: self._demo_buffer.observations[key][t].copy() for key in self._demo_buffer.observations}
+                next_obs = {
+                    key: self._demo_buffer.next_observations[key][t].copy()
+                    for key in self._demo_buffer.next_observations
+                }
+                actions = {key: self._demo_buffer.actions[key][t].copy() for key in self._demo_buffer.actions}
+                rewards = self._demo_buffer.rewards[t].copy()
+                dones = self._demo_buffer.dones[t].copy()
+                self.replay_buffer.add(obs, next_obs, actions, rewards, dones, infos)
+
+            print(f"✓ Successfully loaded {demo_size} demo transitions per env into replay buffer")
             print(f"  Replay buffer now: pos={self.replay_buffer.pos}, size={self.replay_buffer.size()}\n")
 
 
