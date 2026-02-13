@@ -11,6 +11,7 @@ from stable_baselines3.hsac import HSAC
 from stable_baselines3.common.utils import polyak_update
 from stable_baselines3.common.type_aliases import HybridDictReplayBufferSamples
 from stable_baselines3.hsac_dex.demo_buffer import DemoBuffer
+from stable_baselines3.common.vec_env import unwrap_vec_normalize
 
 
 class HSAC_DEX(HSAC):
@@ -102,6 +103,28 @@ class HSAC_DEX(HSAC):
             print(f"✓ Successfully loaded {demo_size} demo transitions per env into replay buffer")
             print(f"  Replay buffer now: pos={self.replay_buffer.pos}, size={self.replay_buffer.size()}\n")
 
+            # Update VecNormalize statistics with demonstration data if environment is wrapped
+            vec_normalize = unwrap_vec_normalize(self.env)
+            if vec_normalize is not None:
+                print("Updating VecNormalize statistics with demonstration data...")
+
+                # Prepare demonstration observations for updating statistics
+                if vec_normalize.norm_obs:
+                    demo_obs = {
+                        key: self._demo_buffer.observations[key][:demo_size].copy()
+                        for key in self._demo_buffer.observations
+                    }
+                    vec_normalize.update_from_data(observations=demo_obs, rewards=None)
+                    print(f"  ✓ Updated observation statistics from {demo_size} demo transitions")
+
+                # Prepare demonstration rewards for updating statistics
+                if vec_normalize.norm_reward:
+                    demo_rewards = self._demo_buffer.rewards[:demo_size].copy()
+                    vec_normalize.update_from_data(observations=None, rewards=demo_rewards)
+                    print(f"  ✓ Updated reward statistics from {demo_size} demo transitions")
+
+                print("✓ VecNormalize statistics updated with demonstration data\n")
+
 
     def _compute_propagated_actions(
         self,
@@ -137,19 +160,19 @@ class HSAC_DEX(HSAC):
         # try:
         #     # 选择要打印的obs数量
         #     num_obs_to_print = min(3, obs.shape[0])
-
+        #
         #     # 转换为numpy
         #     obs_np = obs.cpu().numpy()
         #     demo_obs_np = obs_demo.cpu().numpy()
         #     topk_indices_np = topk_indices.cpu().numpy()
-
+        #
         #     for i in range(num_obs_to_print):
         #         nearest_demo_indices = topk_indices_np[i]
-        #         nearest_demo_obs = demo_obs_np[nearest_dWemo_indices]
+        #         nearest_demo_obs = demo_obs_np[nearest_demo_indices]
         #         dist_diff = obs_np[i] - nearest_demo_obs
-
+        #
         #     print(dist_diff)
-
+        #
         # except Exception as e:
         #     print(f"Debug output failed: {e}")
         

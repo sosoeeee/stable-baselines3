@@ -328,3 +328,52 @@ class VecNormalize(VecEnvWrapper):
         """
         with open(save_path, "wb") as file_handler:
             pickle.dump(self, file_handler)
+
+    def update_from_data(
+        self,
+        observations: Optional[Union[np.ndarray, Dict[str, np.ndarray]]] = None,
+        rewards: Optional[np.ndarray] = None,
+    ) -> None:
+        """
+        Update normalization statistics from pre-collected data (e.g., demonstration data).
+        This allows the running mean and std to incorporate offline data, preventing
+        early clipping of values that haven't been explored yet by the policy.
+
+        :param observations: Batch of observations to update obs_rms statistics.
+            Shape should be (batch_size, *obs_shape) for Box spaces or
+            Dict[key, (batch_size, *obs_shape)] for Dict spaces.
+        :param rewards: Batch of rewards to update reward statistics.
+            Shape should be (batch_size,) or (batch_size, n_envs).
+        """
+        if observations is not None and self.norm_obs:
+            if isinstance(observations, dict) and isinstance(self.obs_rms, dict):
+                assert self.norm_obs_keys is not None
+                # Update statistics for each key
+                for key in self.norm_obs_keys:
+                    if key in observations:
+                        obs_data = observations[key]
+                        # Handle both (batch, *shape) and (batch, n_envs, *shape)
+                        if obs_data.ndim > len(self.obs_spaces[key].shape):
+                            # Reshape from (batch, n_envs, *shape) to (batch*n_envs, *shape)
+                            new_shape = (-1,) + self.obs_spaces[key].shape
+                            obs_data = obs_data.reshape(new_shape)
+                        self.obs_rms[key].update(obs_data)
+            else:
+                assert isinstance(self.obs_rms, RunningMeanStd)
+                obs_data = observations
+                # Handle both (batch, *shape) and (batch, n_envs, *shape)
+                if obs_data.ndim > len(self.observation_space.shape):
+                    # Reshape from (batch, n_envs, *shape) to (batch*n_envs, *shape)
+                    new_shape = (-1,) + self.observation_space.shape
+                    obs_data = obs_data.reshape(new_shape)
+                self.obs_rms.update(obs_data)
+
+        if rewards is not None and self.norm_reward:
+            # Handle both (batch,) and (batch, n_envs)
+            if rewards.ndim == 2:
+                # Flatten from (batch, n_envs) to (batch*n_envs,)
+                rewards = rewards.flatten()
+            # For reward normalization, we need to update with returns (discounted rewards)
+            # For simplicity, we update with raw rewards as an approximation
+            # This is reasonable for demonstration data where the return pattern is representative
+            self.ret_rms.update(rewards)
