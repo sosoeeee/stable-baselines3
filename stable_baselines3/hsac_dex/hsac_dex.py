@@ -413,7 +413,7 @@ class HSAC_DEX(HSAC):
             )
             topk_dist_means.append(topk_values.mean().item())
             valid_ratios.append(valid_mask.float().mean().item())
-            max_dists.append(topk_values.max(dim=1)[0].mean().item())
+            max_dists.append(topk_values.max(dim=1)[0].max().item())
             
             # 为每个离散动作a计算 d((a,x̃), (a^e,x^e))
             # all_continuous_actions: (batch, n_actions, param_dim)
