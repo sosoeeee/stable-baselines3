@@ -413,6 +413,52 @@ class HybridCritic(BaseModel):
         
         return q_values
 
+    def forward_all_discrete(
+        self, obs: PyTorchObs, all_continuous_actions: th.Tensor
+    ) -> th.Tensor:
+        """
+        Compute Q-values for all discrete actions using ALL Q-networks,
+        and return the minimum Q-value across all critics.
+        This is used for computing accurate expected target Q-values.
+        
+        :param obs: Observation (batch_size, obs_dim)
+        :param all_continuous_actions: Continuous actions for all discrete actions
+                                       (batch_size, n_discrete_actions, max_param_dim)
+        :return: Minimum Q-values across all critics for all discrete actions 
+                 (batch_size, n_discrete_actions)
+        """
+        # Extract features
+        with th.set_grad_enabled(not self.share_features_extractor):
+            features = self.extract_features(obs, self.features_extractor)
+        batch_size = features.shape[0]
+        
+        # Expand features for all discrete actions: (batch_size, n_discrete_actions, features_dim)
+        features_expanded = features.unsqueeze(1).expand(-1, self.n_discrete_actions, -1)
+        
+        # Create one-hot for all discrete actions: (n_discrete_actions, n_discrete_actions)
+        all_one_hots = th.eye(self.n_discrete_actions, device=features.device)
+        # Expand to batch: (batch_size, n_discrete_actions, n_discrete_actions)
+        all_one_hots = all_one_hots.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        # Concatenate: (batch_size, n_discrete_actions, features_dim + n_discrete_actions + max_param_dim)
+        q_input = th.cat([features_expanded, all_one_hots, all_continuous_actions], dim=-1)
+        
+        # Reshape for batch processing: (batch_size * n_discrete_actions, input_dim)
+        q_input_flat = q_input.reshape(-1, q_input.shape[-1])
+        
+        # Compute Q-values from all Q-networks and take minimum
+        all_q_values = []
+        for q_net in self.q_networks:
+            q_flat = q_net(q_input_flat)  # (batch_size * n_discrete_actions, 1)
+            q_values = q_flat.reshape(batch_size, self.n_discrete_actions)  # (batch_size, n_discrete_actions)
+            all_q_values.append(q_values)
+        
+        # Stack and take minimum: (n_critics, batch_size, n_discrete_actions) -> (batch_size, n_discrete_actions)
+        stacked_q = th.stack(all_q_values, dim=0)
+        min_q_values, _ = th.min(stacked_q, dim=0)
+        
+        return min_q_values
+
 
 class HybridSACPolicy(BasePolicy):
     """
