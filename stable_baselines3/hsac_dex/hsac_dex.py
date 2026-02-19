@@ -277,6 +277,7 @@ class HSAC_DEX(HSAC):
         topk_dist_means = []
         valid_ratios = []
         max_dists = []
+        task_entropys = []
 
         # 使用 self._total_timesteps 作为归一化上限，确保线性衰减到0
         total_timesteps = getattr(self, '_total_timesteps', None)
@@ -326,6 +327,7 @@ class HSAC_DEX(HSAC):
             logits = self.actor.get_task_dist_params(replay_data.observations)
             task_dist = th.distributions.Categorical(logits=logits)
             task_entropy = task_dist.entropy()  # (batch_size,) - exact entropy
+            task_entropys.append(task_entropy.mean().item())
 
             # Get entropy coefficients
             if self.ent_coef_task_optimizer is not None and self.log_ent_coef_task is not None:
@@ -521,5 +523,6 @@ class HSAC_DEX(HSAC):
             self.logger.record("train/topk_dist_mean", float(np.mean(topk_dist_means)) if topk_dist_means else 0.0)
             self.logger.record("train/valid_demo_ratio", float(np.mean(valid_ratios)) if valid_ratios else 0.0)
             self.logger.record("train/max_topk_dist", float(np.mean(max_dists)) if max_dists else 0.0)
+            self.logger.record("train/task_entropy", float(np.mean(task_entropys)) if task_entropys else 0.0)
             # self.logger.record("train/demo_k", self.demo_k)
             # self.logger.record("train/demo_id_margin", self.demo_id_margin)

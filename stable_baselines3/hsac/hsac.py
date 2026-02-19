@@ -215,7 +215,7 @@ class HSAC(OffPolicyAlgorithm):
         # Target entropy for discrete actions (task policy)
         if self.target_entropy_task == "auto":
             # For discrete: -log(1/n) = log(n)
-            self.target_entropy_task = 0.1 * float(np.log(self.n_discrete_actions))
+            self.target_entropy_task = 0.98 * float(np.log(self.n_discrete_actions))
         else:
             self.target_entropy_task = float(self.target_entropy_task)
         
@@ -273,6 +273,7 @@ class HSAC(OffPolicyAlgorithm):
         ent_coef_task_losses, ent_coef_param_losses = [], []
         ent_coefs_task, ent_coefs_param = [], []
         actor_losses, critic_losses = [], []
+        task_entropys = []
 
         for gradient_step in range(gradient_steps):
             # Sample replay buffer
@@ -288,6 +289,7 @@ class HSAC(OffPolicyAlgorithm):
             # Log probabilities for all discrete actions
             task_log_probs = th.log_softmax(logits, dim=-1)  # (batch_size, n_discrete_actions)
             task_entropy = task_dist.entropy()  # (batch_size,)
+            task_entropys.append(task_entropy.mean().item())
 
             # Get entropy coefficients
             if self.ent_coef_task_optimizer is not None and self.log_ent_coef_task is not None:
@@ -448,6 +450,7 @@ class HSAC(OffPolicyAlgorithm):
         self.logger.record("train/ent_coef_param", np.mean(ent_coefs_param))
         self.logger.record("train/actor_loss", np.mean(actor_losses))
         self.logger.record("train/critic_loss", np.mean(critic_losses))
+        self.logger.record("train/task_entropy", float(np.mean(task_entropys)) if task_entropys else 0.0)
         if len(ent_coef_task_losses) > 0:
             self.logger.record("train/ent_coef_task_loss", np.mean(ent_coef_task_losses))
         if len(ent_coef_param_losses) > 0:
