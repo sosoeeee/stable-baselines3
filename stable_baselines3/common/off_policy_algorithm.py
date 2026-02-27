@@ -193,7 +193,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                 assert self.env is not None, (
                     "You must pass an environment when using `HerReplayBuffer` or `HybridHerReplayBuffer`"
                 )
-            replay_buffer_kwargs["env"] = self.env
+                replay_buffer_kwargs["env"] = self.env
             self.replay_buffer = self.replay_buffer_class(
                 self.buffer_size,
                 self.observation_space,
