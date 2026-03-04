@@ -351,8 +351,8 @@ class BasePolicy(BaseModel, ABC):
         This is used by off-policy algorithms to get actions in the internal representation
         that matches the policy's action space (before restore_action transformation).
         
-        By default, calls predict() and returns the action before restore_action.
-        For policies that use restore_action (e.g., HSAC), this should be overridden.
+        By default, calls predict() and returns the action after restore_action. 
+        Therefore, for policies of off-policy algorithms that use restore_action (e.g., HSAC), this should be overridden.
         
         :param observation: the input observation
         :param deterministic: Whether or not to return deterministic actions.

@@ -79,7 +79,7 @@ class HSAC(OffPolicyAlgorithm):
         train_freq: Union[int, Tuple[int, str]] = 1,
         gradient_steps: int = 1,
         action_noise: Optional[ActionNoise] = None,        
-        replay_buffer_class: Optional[Type[ReplayBuffer]] = HybridReplayBuffer, # Use HybridReplayBuffer by default
+        replay_buffer_class: Optional[Type[ReplayBuffer]] = None,
         replay_buffer_kwargs: Optional[Dict[str, Any]] = None,
         optimize_memory_usage: bool = False,
         ent_coef_task: Union[str, float] = "auto",
@@ -215,7 +215,7 @@ class HSAC(OffPolicyAlgorithm):
         # Target entropy for discrete actions (task policy)
         if self.target_entropy_task == "auto":
             # For discrete: -log(1/n) = log(n)
-            self.target_entropy_task = 0.98 * float(np.log(self.n_discrete_actions))
+            self.target_entropy_task = 0.1 * float(np.log(self.n_discrete_actions))
         else:
             self.target_entropy_task = float(self.target_entropy_task)
         
@@ -274,6 +274,20 @@ class HSAC(OffPolicyAlgorithm):
         ent_coefs_task, ent_coefs_param = [], []
         actor_losses, critic_losses = [], []
         task_entropys = []
+
+        # debug
+        # 诊断信息：网络参数统计
+        critic_grad_norms = []
+        actor_grad_norms = []
+        actor_param_max_abs = []
+        critic_param_max_abs = []
+        
+        # Q值统计
+        target_q_means = []
+        current_q_means = []
+        
+        # Reward统计
+        reward_maxs = []
 
         for gradient_step in range(gradient_steps):
             # Sample replay buffer
@@ -381,9 +395,23 @@ class HSAC(OffPolicyAlgorithm):
             critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
             critic_losses.append(critic_loss.item())
 
+            target_q_means.append(target_q_values.mean().item())
+            current_q_means.append(current_q_values[0].mean().item())
+            
+            # 记录当前 batch 的 reward 最大值
+            reward_maxs.append(replay_data.rewards.max().item())
+
             # Optimize the critic
             self.critic.optimizer.zero_grad()
             critic_loss.backward()
+
+            critic_grad_norm_before_clip = 0.0
+            for param in self.critic.parameters():
+                if param.grad is not None:
+                    critic_grad_norm_before_clip += param.grad.data.norm(2).item() ** 2
+            critic_grad_norm_before_clip = critic_grad_norm_before_clip ** 0.5
+            critic_grad_norms.append(critic_grad_norm_before_clip)
+
             self.critic.optimizer.step()
 
             # Compute actor loss - VECTORIZED VERSION
@@ -436,6 +464,15 @@ class HSAC(OffPolicyAlgorithm):
             # Optimize the actor
             self.actor.optimizer.zero_grad()
             actor_loss.backward()
+
+            # Compute gradient norm before clipping
+            actor_grad_norm_before_clip = 0.0
+            for param in self.actor.parameters():
+                if param.grad is not None:
+                    actor_grad_norm_before_clip += param.grad.data.norm(2).item() ** 2
+            actor_grad_norm_before_clip = actor_grad_norm_before_clip ** 0.5
+            actor_grad_norms.append(actor_grad_norm_before_clip)
+
             self.actor.optimizer.step()
 
             # Update target networks
@@ -455,6 +492,19 @@ class HSAC(OffPolicyAlgorithm):
             self.logger.record("train/ent_coef_task_loss", np.mean(ent_coef_task_losses))
         if len(ent_coef_param_losses) > 0:
             self.logger.record("train/ent_coef_param_loss", np.mean(ent_coef_param_losses))
+
+        self.logger.record("train/critic_grad_norm", float(np.mean(critic_grad_norms)) if critic_grad_norms else 0.0)
+        self.logger.record("train/actor_grad_norm", float(np.mean(actor_grad_norms)) if actor_grad_norms else 0.0)
+        if target_q_means:
+            self.logger.record("diagnostic/target_q_mean", float(np.mean(target_q_means)))
+        if current_q_means:
+            self.logger.record("diagnostic/current_q_mean", float(np.mean(current_q_means)))
+        if reward_maxs:
+            self.logger.record("diagnostic/reward_max", float(np.max(reward_maxs)))
+        if actor_param_max_abs:
+            self.logger.record("diagnostic/actor_max_param", float(np.mean(actor_param_max_abs)))
+        if critic_param_max_abs:
+            self.logger.record("diagnostic/critic_max_param", float(np.mean(critic_param_max_abs)))
 
     def learn(
         self: SelfHSAC,
