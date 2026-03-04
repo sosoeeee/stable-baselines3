@@ -174,17 +174,13 @@ class DemoBuffer(HybridDictReplayBuffer):
                 demo_buffer.rewards[pos, env_idx] = rewards[step_idx]
                 demo_buffer.dones[pos, env_idx] = dones[step_idx]
                 
-                if demo_buffer.handle_timeout_termination:
-                    demo_buffer.timeouts[pos, env_idx] = 0.0
-                
                 pos += 1
             
             # 更新该环境的写入位置
             env_positions[env_idx] = pos
         
         # 设置 buffer 的 pos 和 full 标志
-        # pos 设置为最大的环境位置
-        demo_buffer.pos = max(env_positions)
+        demo_buffer.pos = min(env_positions)
         demo_buffer.full = (demo_buffer.pos >= buffer_size)
         
         print(f"✓ Loaded {num_episodes} episodes into {n_envs} environment(s)")
