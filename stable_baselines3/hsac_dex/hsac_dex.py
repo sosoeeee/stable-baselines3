@@ -27,6 +27,7 @@ class HSAC_DEX(HSAC):
         demo_k: int = 5,
         demo_id_margin: float = 1.0,
         demo_dist_threshold: float = 2.0,
+        demo_buffer_kwargs: Optional[dict] = None,
         entropy_ema_alpha: float = 0.1,             # EMA平滑系数，越小越平滑
         entropy_change_threshold: float = 0.002,    # 熵变化率阈值，超过此值认为"显著上升"
         entropy_update_interval: int = 10,          # 每隔多少次train()调用更新一次EMA
@@ -41,6 +42,7 @@ class HSAC_DEX(HSAC):
         self.demo_k = demo_k
         self.demo_id_margin = demo_id_margin
         self.demo_dist_threshold = demo_dist_threshold
+        self.demo_buffer_kwargs = demo_buffer_kwargs or {}
         self._demo_buffer: Optional[DemoBuffer] = None
         # control the entropy coef of discrete action
         self.max_entropy_weighted = max_entropy_weighted
@@ -62,13 +64,13 @@ class HSAC_DEX(HSAC):
         self.task_entropy_ema = float(np.log(self.n_discrete_actions)) if hasattr(self, 'target_entropy_task') else 0.0
         
         if self.demo_path is not None:
-            # 创建 demo_buffer，使用与 replay_buffer 相同的 n_envs
+            # 创建 demo_buffer，使用独立的单环境配置
             self._demo_buffer = DemoBuffer.from_npz(
                 path=self.demo_path,
                 observation_space=self.observation_space,
                 action_space=self.action_space,
                 device=self.device,
-                n_envs=self.n_envs,  # 使用相同的 n_envs
+                **self.demo_buffer_kwargs,
             )
             
             self.demo_batch_size = min(self.demo_batch_size, self._demo_buffer.size())
