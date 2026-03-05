@@ -43,6 +43,11 @@ class DemoBuffer(HybridHerReplayBuffer):
         n_envs = 1  # Demo buffer always uses single environment
         if device is None:
             device = th.device("cpu")
+        if "env" not in her_kwargs:
+            raise ValueError(
+                "DemoBuffer.from_npz() requires `env` in her_kwargs because "
+                "HybridHerReplayBuffer needs it for HER reward computation."
+            )
         
         # Collect all npz files
         if os.path.isfile(path):
