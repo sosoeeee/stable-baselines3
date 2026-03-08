@@ -129,13 +129,14 @@ class HSAC(OffPolicyAlgorithm):
         self.original_action_space = self.action_space
 
         # Reorganize action space to internal format
-        self.action_space, d_key, c_key = self._reorganize_action_space(self.original_action_space)
+        self.action_space, d_key, c_key, param_mask = self._reorganize_action_space(self.original_action_space)
         
         # Set policy kwargs (no longer passing n_discrete_actions and max_param_dim)
         self.policy_kwargs = policy_kwargs or {}
         self.policy_kwargs.update({
             "d_key": d_key,
             "c_key": c_key,
+            "param_mask": param_mask,
         })
 
         self.target_entropy_task = target_entropy_task
@@ -155,13 +156,15 @@ class HSAC(OffPolicyAlgorithm):
         if _init_setup_model:
             self._setup_model()
 
-    def _reorganize_action_space(self, original_action_space: spaces.Dict) -> Tuple[spaces.Dict, str, str]:
+    def _reorganize_action_space(self, original_action_space: spaces.Dict) -> Tuple[spaces.Dict, str, str, np.ndarray]:
         """
         Reorganize action space from Gym format (id, params0, params1, ...) 
         to HSAC internal format (discrete, continuous).
         
         :param original_action_space: Original Dict action space from Gym
-        :return: (reorganized_space, d_key, c_key, n_discrete_actions, max_param_dim)
+        :return: (reorganized_space, d_key, c_key, param_mask)
+            param_mask: numpy array of shape (n_discrete_actions, max_param_dim)
+                        where param_mask[i, :d_i] = 1.0 for valid dimensions of action i
         """
         # Find discrete action key (usually 'id')
         d_key = None
@@ -176,16 +179,30 @@ class HSAC(OffPolicyAlgorithm):
         if d_key is None:
             raise ValueError("No discrete action found in action space")
         
+        # Sort param_keys to ensure consistent ordering (params0, params1, ...)
+        param_keys = sorted(param_keys, key=lambda x: int(re.search(r'\d+', x).group()))
+        
         # Get number of discrete actions
         n_discrete_actions = original_action_space.spaces[d_key].n
         
-        # Get max parameter dimension
-        max_param_dim = 0
+        # Get parameter dimensions for each discrete action and compute max_param_dim
+        param_dims = []
         for key in param_keys:
             param_space = original_action_space.spaces[key]
             if isinstance(param_space, spaces.Box):
                 dim = int(np.prod(param_space.shape))
-                max_param_dim = max(max_param_dim, dim)
+                param_dims.append(dim)
+            else:
+                param_dims.append(0)
+        
+        max_param_dim = max(param_dims) if param_dims else 0
+        
+        # Build param_mask: (n_discrete_actions, max_param_dim)
+        # param_mask[i, :d_i] = 1.0 for valid dimensions, 0.0 otherwise
+        param_mask = np.zeros((n_discrete_actions, max_param_dim), dtype=np.float32)
+        for action_idx, dim in enumerate(param_dims):
+            if dim > 0:
+                param_mask[action_idx, :dim] = 1.0
         
         # Create reorganized action space
         c_key = "continuous"
@@ -194,7 +211,7 @@ class HSAC(OffPolicyAlgorithm):
             c_key: spaces.Box(low=-1.0, high=1.0, shape=(max_param_dim,), dtype=np.float32),
         })
         
-        return reorganized_space, "discrete", c_key
+        return reorganized_space, "discrete", c_key, param_mask
 
     def _setup_model(self) -> None:
         super()._setup_model()
@@ -219,12 +236,22 @@ class HSAC(OffPolicyAlgorithm):
         else:
             self.target_entropy_task = float(self.target_entropy_task)
         
-        # Target entropy for continuous parameters
+        # Target entropy for continuous parameters (per discrete action)
+        # Use param_mask to compute target entropy for each discrete action
         if self.target_entropy_param == "auto":
-            # For continuous: -dim (standard SAC formula)
-            self.target_entropy_param = float(-self.max_param_dim)
+            # For continuous: -dim for each action's valid dimensions
+            # target_entropy_param_tensor: (n_discrete_actions,)
+            self.target_entropy_param = -self.actor.param_mask.sum(dim=-1)  # (n_discrete_actions,)
+        elif isinstance(self.target_entropy_param, th.Tensor):
+            # Already a tensor (e.g., loaded from checkpoint), just move to correct device
+            self.target_entropy_param = self.target_entropy_param.to(self.device)
         else:
-            self.target_entropy_param = float(self.target_entropy_param)
+            # If manually specified, broadcast to all discrete actions
+            self.target_entropy_param = th.full(
+                (self.n_discrete_actions,), 
+                float(self.target_entropy_param), 
+                device=self.device
+            )
         
         # Entropy coefficient for task (discrete)
         if isinstance(self.ent_coef_task, str) and self.ent_coef_task.startswith("auto"):
@@ -256,7 +283,7 @@ class HSAC(OffPolicyAlgorithm):
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         """
         Update policy using the currently gathered rollout buffer.
-        Implements the dual-entropy Hybrid SAC algorithm.
+        Implements the dual-entropy Hybrid SAC algorithm with param_mask support.
         """
         # Switch to train mode
         self.policy.set_training_mode(True)
@@ -275,48 +302,60 @@ class HSAC(OffPolicyAlgorithm):
         actor_losses, critic_losses = [], []
         task_entropys = []
 
-        # debug
-        # 诊断信息：网络参数统计
+        # debug: diagnostic info
         critic_grad_norms = []
         actor_grad_norms = []
         actor_param_max_abs = []
         critic_param_max_abs = []
         
-        # Q值统计
+        # Q value statistics
         target_q_means = []
         current_q_means = []
         
-        # Reward统计
+        # Reward statistics
         reward_maxs = []
 
         for gradient_step in range(gradient_steps):
             # Sample replay buffer
-            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
+            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
 
-            # Current actions and log probs from actor
-            _, _, continuous_log_prob = self.actor.action_log_prob(replay_data.observations)
-
-            # Get task distribution for current state
-            logits = self.actor.get_task_dist_params(replay_data.observations)
-            task_dist = th.distributions.Categorical(logits=logits)
-            task_probs = task_dist.probs  # (batch_size, n_discrete_actions)
-            # Log probabilities for all discrete actions
-            task_log_probs = th.log_softmax(logits, dim=-1)  # (batch_size, n_discrete_actions)
-            task_entropy = task_dist.entropy()  # (batch_size,)
+            # Use evaluate_all_actions for current state (for actor loss computation)
+            (task_probs, task_log_probs, task_entropy, 
+             all_continuous_actions, all_continuous_log_probs) = self.actor.evaluate_all_actions(
+                replay_data.observations
+            )
             task_entropys.append(task_entropy.mean().item())
 
             # Get entropy coefficients
             if self.ent_coef_task_optimizer is not None and self.log_ent_coef_task is not None:
                 ent_coef_task = th.exp(self.log_ent_coef_task.detach())
-                ent_coef_task_loss = self.log_ent_coef_task * (task_entropy - self.target_entropy_task).detach().mean()
+                ent_coef_task_loss = self.log_ent_coef_task * ((
+                    task_entropy - self.target_entropy_task
+                ).detach()).mean()
                 ent_coef_task_losses.append(ent_coef_task_loss.item())
             else:
                 ent_coef_task = self.ent_coef_task_tensor
                 ent_coef_task_loss = None
 
+            # For ent_coef_param loss, we need to use the current sampled action's target entropy
+            # Get discrete actions from replay buffer
+            discrete_actions = replay_data.actions[self.d_key].long().squeeze(-1)  # (batch_size,)
+            # Index target entropy by discrete action: (batch_size,)
+            current_target_entropy_param = self.target_entropy_param[discrete_actions]
+            
+            # Get continuous log prob for the sampled discrete action from all_continuous_log_probs
+            sampled_continuous_log_prob = all_continuous_log_probs.gather(
+                1, discrete_actions.unsqueeze(-1)
+            ).squeeze(-1)  # (batch_size,)
+            
             if self.ent_coef_param_optimizer is not None and self.log_ent_coef_param is not None:
                 ent_coef_param = th.exp(self.log_ent_coef_param.detach())
-                ent_coef_param_loss = -(self.log_ent_coef_param * (continuous_log_prob + self.target_entropy_param).detach()).mean()
+                # Use action-specific target entropy
+                ent_coef_param_loss = -(
+                    self.log_ent_coef_param * (
+                        sampled_continuous_log_prob + current_target_entropy_param
+                    ).detach()
+                ).mean()
                 ent_coef_param_losses.append(ent_coef_param_loss.item())
             else:
                 ent_coef_param = self.ent_coef_param_tensor
@@ -337,53 +376,26 @@ class HSAC(OffPolicyAlgorithm):
                 self.ent_coef_param_optimizer.step()
 
             with th.no_grad():
-                # Compute target Q value using exact expectation over discrete actions
-                # y = r + gamma*(1-d) * sum_a' [ pi_task(a'|s') * (min_i Q_targ(s',a',x') - alpha_task*log(pi_task(a'|s')) - alpha_param*log(pi_param(x'|s',a'))) ]
-                
-                # Get task distribution for next state
-                next_logits = self.actor.get_task_dist_params(replay_data.next_observations)
-                next_task_probs = th.softmax(next_logits, dim=-1)  # (batch_size, n_discrete_actions)
-                next_task_log_probs = th.log_softmax(next_logits, dim=-1)  # (batch_size, n_discrete_actions)
-                
-                # Get all parameter distributions for next state
-                # all_means, all_log_stds: (batch_size, n_discrete_actions, max_param_dim)
-                all_next_means, all_next_log_stds = self.actor.get_all_param_dist_params(replay_data.next_observations)
-                
-                # Sample continuous actions for all discrete actions using reparameterization
-                all_next_stds = th.exp(all_next_log_stds)
-                noise = th.randn_like(all_next_means)
-                all_next_continuous_pretanh = all_next_means + all_next_stds * noise
-                all_next_continuous_actions = th.tanh(all_next_continuous_pretanh)  # (batch_size, n_discrete_actions, max_param_dim)
-                
-                # Compute log prob for continuous actions (tanh squashed gaussian)
-                gaussian_log_prob = -0.5 * (
-                    ((all_next_continuous_pretanh - all_next_means) / (all_next_stds + 1e-6)) ** 2 
-                    + 2 * all_next_log_stds 
-                    + np.log(2 * np.pi)
+                # Use evaluate_all_actions for next state (for target Q computation)
+                (next_task_probs, next_task_log_probs, _, 
+                 all_next_continuous_actions, all_next_continuous_log_probs) = self.actor.evaluate_all_actions(
+                    replay_data.next_observations
                 )
-                gaussian_log_prob = gaussian_log_prob.sum(dim=-1)  # (batch_size, n_discrete_actions)
-                
-                # Squashing correction
-                squash_correction = th.log(1 - all_next_continuous_actions ** 2 + 1e-6).sum(dim=-1)
-                all_next_continuous_log_probs = gaussian_log_prob - squash_correction  # (batch_size, n_discrete_actions)
                 
                 # Compute min Q-values across all critics for all discrete actions
-                # all_next_q_values: (batch_size, n_discrete_actions)
                 all_next_q_values = self.critic_target.forward_all_discrete(
                     replay_data.next_observations, all_next_continuous_actions
                 )
                 
-                # Compute value for each discrete action: Q - alpha_task*log(pi_task) - alpha_param*log(pi_param)
-                # (batch_size, n_discrete_actions)
+                # Compute value for each discrete action
                 all_next_values = (
                     all_next_q_values 
                     - ent_coef_task * next_task_log_probs 
                     - ent_coef_param * all_next_continuous_log_probs
                 )
                 
-                # Compute expected value by summing over discrete actions weighted by task policy
-                # next_v = sum_a' [ pi_task(a'|s') * V(s', a') ]
-                next_v = (next_task_probs * all_next_values).sum(dim=1, keepdim=True)  # (batch_size, 1)
+                # Compute expected value weighted by task policy
+                next_v = (next_task_probs * all_next_values).sum(dim=1, keepdim=True)
                 
                 # Compute target Q values
                 target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_v
@@ -392,13 +404,14 @@ class HSAC(OffPolicyAlgorithm):
             current_q_values = self.critic(replay_data.observations, replay_data.actions)
 
             # Compute critic loss
-            critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
+            critic_loss = 0.5 * sum(
+                F.mse_loss(current_q, target_q_values) for current_q in current_q_values
+            )
             critic_losses.append(critic_loss.item())
 
             target_q_means.append(target_q_values.mean().item())
             current_q_means.append(current_q_values[0].mean().item())
             
-            # 记录当前 batch 的 reward 最大值
             reward_maxs.append(replay_data.rewards.max().item())
 
             # Optimize the critic
@@ -414,50 +427,21 @@ class HSAC(OffPolicyAlgorithm):
 
             self.critic.optimizer.step()
 
-            # Compute actor loss - VECTORIZED VERSION
-            # For hybrid SAC: we marginalize over discrete actions
-            # actor_loss = E_a[pi(a|s) * (alpha_task*log(pi(a|s)) + alpha_param*log(pi(x|s,a)) - Q(s,a,x))]
+            # Compute actor loss using evaluate_all_actions results (already computed above)
+            # No need to re-evaluate since entropy coef losses used .detach()
             
-            # Get all parameter distributions at once
-            # all_means, all_log_stds: (batch_size, n_discrete_actions, max_param_dim)
-            all_means, all_log_stds = self.actor.get_all_param_dist_params(replay_data.observations)
-            
-            # Sample continuous actions for all discrete actions using reparameterization trick
-            all_stds = th.exp(all_log_stds)
-            noise = th.randn_like(all_means)
-            all_continuous_pretanh = all_means + all_stds * noise
-            all_continuous_actions = th.tanh(all_continuous_pretanh)
-            
-            # Compute log prob for continuous actions (tanh squashed gaussian)
-            # log_prob = N(pretanh|mean, std).log_prob - log(1 - tanh(pretanh)^2)
-            gaussian_log_prob = -0.5 * (
-                ((all_continuous_pretanh - all_means) / (all_stds + 1e-6)) ** 2 
-                + 2 * all_log_stds 
-                + np.log(2 * np.pi)
+            # Compute Q-values for all discrete actions
+            all_q_values = self.critic.forward_all_discrete(
+                replay_data.observations, all_continuous_actions
             )
-            gaussian_log_prob = gaussian_log_prob.sum(dim=-1)  # (batch_size, n_discrete_actions)
-            
-            # Squashing correction
-            squash_correction = th.log(1 - all_continuous_actions ** 2 + 1e-6).sum(dim=-1)
-            all_continuous_log_probs = gaussian_log_prob - squash_correction  # (batch_size, n_discrete_actions)
-            
-            # Compute Q-values for all discrete actions at once
-            # all_q_values: (batch_size, n_discrete_actions, 1)
-            # q_1    version:
-            # all_q_values = self.critic.q1_forward_all_discrete(replay_data.observations, all_continuous_actions)
-            # all_q_values = all_q_values.squeeze(-1)  # (batch_size, n_discrete_actions)
-            
-            # q_min  version:
-            all_q_values = self.critic.forward_all_discrete(replay_data.observations, all_continuous_actions)
 
             # Compute weighted actor loss
-            # actor_loss = sum_a [ pi(a|s) * (alpha_task * log(pi(a|s)) + alpha_param * log(pi(x|s,a)) - Q(s,a,x)) ]
             weighted_loss = task_probs * (
                 ent_coef_task * task_log_probs +
                 ent_coef_param * all_continuous_log_probs -
                 all_q_values
-            )  # (batch_size, n_discrete_actions)
-            actor_loss = weighted_loss.sum(dim=1).mean()  # Sum over discrete actions, mean over batch
+            )
+            actor_loss = weighted_loss.sum(dim=1).mean()
             
             actor_losses.append(actor_loss.item())
 
@@ -465,7 +449,6 @@ class HSAC(OffPolicyAlgorithm):
             self.actor.optimizer.zero_grad()
             actor_loss.backward()
 
-            # Compute gradient norm before clipping
             actor_grad_norm_before_clip = 0.0
             for param in self.actor.parameters():
                 if param.grad is not None:

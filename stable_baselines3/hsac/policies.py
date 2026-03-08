@@ -42,6 +42,7 @@ class HybridActor(BasePolicy):
     :param c_key: Key prefix for continuous parameters in action space Dict
     :param n_discrete_actions: Number of discrete actions
     :param max_param_dim: Maximum dimension of continuous parameters
+    :param param_mask: Mask for valid parameter dimensions (n_discrete_actions, max_param_dim)
     """
 
     action_space: spaces.Dict
@@ -57,6 +58,8 @@ class HybridActor(BasePolicy):
         normalize_images: bool = True,
         d_key: str = "discrete",
         c_key: str = "continuous",
+        discrete_epsilon: float = 0.0,
+        param_mask: Optional[np.ndarray] = None,
     ):
         super().__init__(
             observation_space,
@@ -71,6 +74,7 @@ class HybridActor(BasePolicy):
         self.activation_fn = activation_fn
         self.d_key = d_key
         self.c_key = c_key
+        self.discrete_epsilon = discrete_epsilon  # Epsilon for discrete action exploration
         
         # Get n_discrete_actions from action space
         assert isinstance(action_space, spaces.Dict), "Action space must be Dict"
@@ -82,6 +86,20 @@ class HybridActor(BasePolicy):
         assert c_key in action_space.spaces, f"Key {c_key} not found in action space"
         assert isinstance(action_space.spaces[c_key], spaces.Box), "Continuous action must be Box space"
         self.max_param_dim = int(np.prod(action_space.spaces[c_key].shape))
+
+        # Initialize param_mask (will be moved to correct device later)
+        # param_mask: (n_discrete_actions, max_param_dim) - 1.0 for valid dims, 0.0 otherwise
+        if param_mask is not None:
+            self.register_buffer(
+                "param_mask", 
+                th.as_tensor(param_mask, dtype=th.float32)
+            )
+        else:
+            # Default: all dimensions are valid for all actions
+            self.register_buffer(
+                "param_mask",
+                th.ones(self.n_discrete_actions, self.max_param_dim, dtype=th.float32)
+            )
 
         # Action distribution for continuous parameters (similar to SAC)
         self.param_action_dist = SquashedDiagGaussianDistribution(self.max_param_dim, epsilon=1e-6)
@@ -193,6 +211,61 @@ class HybridActor(BasePolicy):
         
         return all_means, all_log_stds
 
+    def evaluate_all_actions(
+        self, obs: PyTorchObs
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Unified evaluation method for all discrete actions with param_mask applied.
+        This integrates reparameterization and probability computation for both
+        Target Q computation and Actor Loss computation.
+        
+        :param obs: Observation (batch_size, obs_dim)
+        :return: Tuple of:
+            - task_probs: (batch_size, n_discrete_actions)
+            - task_log_probs: (batch_size, n_discrete_actions)
+            - task_entropy: (batch_size,)
+            - all_continuous_actions: (batch_size, n_discrete_actions, max_param_dim) with mask applied
+            - all_continuous_log_probs: (batch_size, n_discrete_actions) with log-prob mask applied
+        """
+        # Get task distribution
+        logits = self.get_task_dist_params(obs)
+        task_dist = th.distributions.Categorical(logits=logits)
+        task_probs = task_dist.probs  # (batch_size, n_discrete_actions)
+        task_log_probs = th.log_softmax(logits, dim=-1)  # (batch_size, n_discrete_actions)
+        task_entropy = task_dist.entropy()  # (batch_size,)
+        
+        # Get all parameter distributions
+        all_means, all_log_stds = self.get_all_param_dist_params(obs)
+        # all_means, all_log_stds: (batch_size, n_discrete_actions, max_param_dim)
+        
+        # Reparameterization: sample continuous actions for all discrete actions
+        all_stds = th.exp(all_log_stds)
+        noise = th.randn_like(all_means)
+        all_continuous_pretanh = all_means + all_stds * noise
+        
+        # Apply action mask: mask out invalid dimensions
+        # param_mask: (n_discrete_actions, max_param_dim) -> expand to (1, n_discrete_actions, max_param_dim)
+        all_continuous_actions = th.tanh(all_continuous_pretanh) * self.param_mask.unsqueeze(0)
+        
+        # Compute log prob for continuous actions (tanh squashed gaussian)
+        # gaussian_log_prob: (batch_size, n_discrete_actions, max_param_dim)
+        gaussian_log_prob = -0.5 * (
+            ((all_continuous_pretanh - all_means) / (all_stds + 1e-6)) ** 2 
+            + 2 * all_log_stds 
+            + np.log(2 * np.pi)
+        )
+        
+        # Squashing correction: (batch_size, n_discrete_actions, max_param_dim)
+        squash_correction = th.log(1 - all_continuous_actions ** 2 + 1e-6)
+        
+        # Apply log-prob mask before summing
+        # Only sum over valid dimensions for each discrete action
+        all_continuous_log_probs = (
+            (gaussian_log_prob - squash_correction) * self.param_mask.unsqueeze(0)
+        ).sum(dim=-1)  # (batch_size, n_discrete_actions)
+        
+        return task_probs, task_log_probs, task_entropy, all_continuous_actions, all_continuous_log_probs
+
     def forward(self, obs: PyTorchObs, deterministic: bool = False) -> Tuple[Dict[str, th.Tensor], th.Tensor, th.Tensor]:
         """
         Forward pass: sample both discrete and continuous actions.
@@ -205,19 +278,56 @@ class HybridActor(BasePolicy):
         # Get task distribution parameters and sample discrete action
         logits = self.get_task_dist_params(obs)
         task_dist = th.distributions.Categorical(logits=logits)
+        
         if deterministic:
             discrete_action = th.argmax(task_dist.probs, dim=1)
         else:
-            discrete_action = task_dist.sample()
+            # Epsilon-greedy exploration for discrete actions
+            batch_size = obs.shape[0] if isinstance(obs, th.Tensor) else obs['observation'].shape[0]
+            
+            # Sample from uniform distribution with probability epsilon
+            if self.discrete_epsilon > 0:
+                # Generate random mask for exploration
+                explore_mask = th.rand(batch_size, device=logits.device) < self.discrete_epsilon
+                
+                # Sample from policy
+                policy_action = task_dist.sample()
+                
+                # Sample uniformly from action space
+                uniform_action = th.randint(0, self.n_discrete_actions, (batch_size,), device=logits.device)
+                
+                # Mix exploration and exploitation
+                discrete_action = th.where(explore_mask, uniform_action, policy_action)
+            else:
+                discrete_action = task_dist.sample()
+        
         discrete_log_prob = task_dist.log_prob(discrete_action)
         
-        # Get parameter distribution parameters and sample continuous action
-        # Use actions_from_params similar to SAC
-        mean_actions, log_std, kwargs = self.get_param_dist_params(obs, discrete_action)
-        continuous_action = self.param_action_dist.actions_from_params(
-            mean_actions, log_std, deterministic=deterministic, **kwargs
+        # Get parameter distribution parameters
+        mean_actions, log_std, _ = self.get_param_dist_params(obs, discrete_action)
+        
+        # Get current mask for selected discrete actions: (batch_size, max_param_dim)
+        current_mask = self.param_mask[discrete_action.long()]
+        
+        # Sample continuous action with reparameterization
+        std = th.exp(log_std)
+        if deterministic:
+            continuous_pretanh = mean_actions
+        else:
+            noise = th.randn_like(mean_actions)
+            continuous_pretanh = mean_actions + std * noise
+        
+        # Apply action mask
+        continuous_action = th.tanh(continuous_pretanh) * current_mask
+        
+        # Compute log prob with mask applied
+        gaussian_log_prob = -0.5 * (
+            ((continuous_pretanh - mean_actions) / (std + 1e-6)) ** 2 
+            + 2 * log_std 
+            + np.log(2 * np.pi)
         )
-        continuous_log_prob = self.param_action_dist.log_prob(continuous_action)
+        squash_correction = th.log(1 - continuous_action ** 2 + 1e-6)
+        continuous_log_prob = ((gaussian_log_prob - squash_correction) * current_mask).sum(dim=-1)
         
         actions = {
             self.d_key: discrete_action,
@@ -240,12 +350,28 @@ class HybridActor(BasePolicy):
         discrete_action = task_dist.sample()
         discrete_log_prob = task_dist.log_prob(discrete_action)
         
-        # Get parameter distribution parameters and sample continuous action
-        # Use log_prob_from_params similar to SAC
-        mean_actions, log_std, kwargs = self.get_param_dist_params(obs, discrete_action)
-        continuous_action, continuous_log_prob = self.param_action_dist.log_prob_from_params(
-            mean_actions, log_std, **kwargs
+        # Get parameter distribution parameters
+        mean_actions, log_std, _ = self.get_param_dist_params(obs, discrete_action)
+        
+        # Get current mask for selected discrete actions: (batch_size, max_param_dim)
+        current_mask = self.param_mask[discrete_action.long()]
+        
+        # Sample continuous action with reparameterization
+        std = th.exp(log_std)
+        noise = th.randn_like(mean_actions)
+        continuous_pretanh = mean_actions + std * noise
+        
+        # Apply action mask
+        continuous_action = th.tanh(continuous_pretanh) * current_mask
+        
+        # Compute log prob with mask applied
+        gaussian_log_prob = -0.5 * (
+            ((continuous_pretanh - mean_actions) / (std + 1e-6)) ** 2 
+            + 2 * log_std 
+            + np.log(2 * np.pi)
         )
+        squash_correction = th.log(1 - continuous_action ** 2 + 1e-6)
+        continuous_log_prob = ((gaussian_log_prob - squash_correction) * current_mask).sum(dim=-1)
         
         actions = {
             self.d_key: discrete_action,
@@ -479,6 +605,7 @@ class HybridSACPolicy(BasePolicy):
     :param c_key: Key for continuous parameters
     :param n_discrete_actions: Number of discrete actions
     :param max_param_dim: Maximum dimension of continuous parameters
+    :param param_mask: Mask for valid parameter dimensions (n_discrete_actions, max_param_dim)
     """
 
     actor: HybridActor
@@ -502,6 +629,8 @@ class HybridSACPolicy(BasePolicy):
         d_key: str = "discrete",
         c_key: str = "continuous",
         share_features_extractor: bool = False,
+        discrete_epsilon: float = 0.0,
+        param_mask: Optional[np.ndarray] = None,
     ):
         super().__init__(
             observation_space,
@@ -517,6 +646,8 @@ class HybridSACPolicy(BasePolicy):
         self.use_sde = use_sde
         self.d_key = d_key
         self.c_key = c_key
+        self.discrete_epsilon = discrete_epsilon
+        self.param_mask = param_mask
         
         # Get parameters from action space
         assert isinstance(action_space, spaces.Dict), "Action space must be Dict"
@@ -552,6 +683,10 @@ class HybridSACPolicy(BasePolicy):
             "normalize_images": normalize_images,
         }
         self.actor_kwargs = self.net_args.copy()
+        self.actor_kwargs.update({
+            "discrete_epsilon": self.discrete_epsilon,
+            "param_mask": self.param_mask,
+        })
         self.critic_kwargs = self.net_args.copy()
         self.critic_kwargs.update(
             {
@@ -805,6 +940,7 @@ class MultiInputPolicy(HybridSACPolicy):
     :param n_critics: Number of critic networks to create.
     :param share_features_extractor: Whether to share or not the features extractor
         between the actor and the critic (this saves computation time)
+    :param param_mask: Mask for valid parameter dimensions (n_discrete_actions, max_param_dim)
     """
 
     def __init__(
@@ -824,6 +960,8 @@ class MultiInputPolicy(HybridSACPolicy):
         d_key: str = "discrete",
         c_key: str = "continuous",
         share_features_extractor: bool = False,
+        discrete_epsilon: float = 0.0,
+        param_mask: Optional[np.ndarray] = None,
     ):
         super().__init__(
             observation_space,
@@ -841,6 +979,8 @@ class MultiInputPolicy(HybridSACPolicy):
             d_key,
             c_key,
             share_features_extractor,
+            discrete_epsilon,
+            param_mask,
         )
 
 # Alias for compatibility
