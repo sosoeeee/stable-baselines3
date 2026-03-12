@@ -23,6 +23,9 @@ class HSAC_DEX(HSAC):
         demo_path: Optional[str] = None,
         demo_batch_size: int = 256,
         demo_aux_weight: float = 1.0,
+        use_dex_aux_loss: bool = True,
+        demo_bc_weight: float = 1.0,
+        use_bc_loss: bool = True,
         replay_demo_ratio: float = 0.0,
         demo_k: int = 5,
         demo_id_margin: float = 1.0,
@@ -38,6 +41,9 @@ class HSAC_DEX(HSAC):
         self.demo_path = demo_path
         self.demo_batch_size = demo_batch_size
         self.demo_aux_weight = demo_aux_weight
+        self.use_dex_aux_loss = use_dex_aux_loss
+        self.demo_bc_weight = demo_bc_weight
+        self.use_bc_loss = use_bc_loss
         self.replay_demo_ratio = replay_demo_ratio
         self.demo_k = demo_k
         self.demo_id_margin = demo_id_margin
@@ -254,6 +260,7 @@ class HSAC_DEX(HSAC):
         ent_coef_task_losses, ent_coef_param_losses = [], []
         ent_coefs_task, ent_coefs_param = [], []
         actor_losses, critic_losses = [], []
+        bc_losses = []
         
         # debug
         dist_losses = []
@@ -308,15 +315,21 @@ class HSAC_DEX(HSAC):
             else:
                 replay_data = self._concat_replay_samples(replay_part, demo_part)
 
-            # Sample from demo buffer (returns HybridDictReplayBufferSamples)
-            demo_data = self._demo_buffer.sample(self.demo_batch_size, env=self._vec_normalize_env)
-            
-            # Extract observation tensor (use 'observation' key from dict)
-            demo_obs_t = demo_data.observations["observation"]
-            
-            # Extract action components
-            demo_ids = demo_data.actions["discrete"]
-            demo_params = demo_data.actions["continuous"]
+            demo_obs_t = None
+            demo_ids = None
+            demo_params = None
+            if self.use_dex_aux_loss:
+                if self._demo_buffer is None:
+                    raise RuntimeError("demo_path must be provided when use_dex_aux_loss is True")
+                # Sample from demo buffer (returns HybridDictReplayBufferSamples)
+                demo_data = self._demo_buffer.sample(self.demo_batch_size, env=self._vec_normalize_env)
+
+                # Extract observation tensor (use 'observation' key from dict)
+                demo_obs_t = demo_data.observations["observation"]
+
+                # Extract action components
+                demo_ids = demo_data.actions["discrete"]
+                demo_params = demo_data.actions["continuous"]
 
             # Single forward pass: Use evaluate_all_actions for current state
             # This computes task distribution, all continuous actions, and log probs in one pass
@@ -409,24 +422,28 @@ class HSAC_DEX(HSAC):
                 all_next_q_values = self.critic_target.forward_all_discrete(
                     replay_data.next_observations, all_next_continuous_actions
                 )
-                
-                # ------------ DEX: Compute demo distance for all discrete actions ------------
-                prop_ids, prop_params, _, valid_mask = self._compute_propagated_actions(
-                    replay_data.next_observations["observation"], demo_obs_t, demo_ids, demo_params
-                )
-                
-                # Create all discrete action indices: (batch_size, n_discrete_actions)
-                batch_size_next = all_next_continuous_actions.shape[0]
-                n_actions_next = all_next_continuous_actions.shape[1]
-                all_next_discrete_actions = th.arange(n_actions_next, device=self.device).unsqueeze(0).expand(batch_size_next, -1)
-                
-                # Compute demo distance for all discrete actions: (batch_size, n_discrete_actions)
-                all_next_act_dist = self._hybrid_act_dist(
-                    all_next_discrete_actions, all_next_continuous_actions, prop_ids, prop_params
-                )
-                
-                # Apply mask: (batch_size, n_discrete_actions) * (batch_size, 1)
-                all_next_masked_dist = all_next_act_dist * valid_mask.unsqueeze(1).float()
+                if self.use_dex_aux_loss:
+                    # ------------ DEX: Compute demo distance for all discrete actions ------------
+                    prop_ids, prop_params, _, valid_mask = self._compute_propagated_actions(
+                        replay_data.next_observations["observation"], demo_obs_t, demo_ids, demo_params
+                    )
+
+                    # Create all discrete action indices: (batch_size, n_discrete_actions)
+                    batch_size_next = all_next_continuous_actions.shape[0]
+                    n_actions_next = all_next_continuous_actions.shape[1]
+                    all_next_discrete_actions = th.arange(n_actions_next, device=self.device).unsqueeze(0).expand(batch_size_next, -1)
+
+                    # Compute demo distance for all discrete actions: (batch_size, n_discrete_actions)
+                    all_next_act_dist = self._hybrid_act_dist(
+                        all_next_discrete_actions, all_next_continuous_actions, prop_ids, prop_params
+                    )
+
+                    # Apply mask: (batch_size, n_discrete_actions) * (batch_size, 1)
+                    all_next_masked_dist = all_next_act_dist * valid_mask.unsqueeze(1).float()
+                    dex = (-next_task_probs * demo_aux_weight_scaled * all_next_masked_dist).sum(dim=1, keepdim=True)
+                else:
+                    all_next_masked_dist = th.zeros_like(all_next_q_values)
+                    dex = th.zeros((all_next_q_values.shape[0], 1), device=self.device)
                 # -------------------------------------------------------------------------------
                 
                 # Compute value for each discrete action: Q - alpha_task*log(pi_task) - alpha_param*log(pi_param) - lambda*d
@@ -445,7 +462,6 @@ class HSAC_DEX(HSAC):
                 # debug
                 Tent = (-next_task_probs * ent_coef_task * next_task_log_probs).sum(dim=1, keepdim=True)
                 Pent = (-next_task_probs * ent_coef_param * all_next_continuous_log_probs).sum(dim=1, keepdim=True)
-                dex = (-next_task_probs * demo_aux_weight_scaled * all_next_masked_dist).sum(dim=1, keepdim=True)
 
                 # Compute target Q values
                 target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_v
@@ -523,28 +539,31 @@ class HSAC_DEX(HSAC):
             # Compute Q-values for all discrete actions using min over all critics
             all_q_values = self.critic.forward_all_discrete(replay_data.observations, all_continuous_actions)
 
-            # 计算传播的演示动作: (a^e, x^e)
-            prop_ids, prop_params, topk_values, valid_mask = self._compute_propagated_actions(
-                replay_data.observations["observation"], demo_obs_t, demo_ids, demo_params
-            )
-            topk_dist_means.append(topk_values.mean().item())
-            valid_ratios.append(valid_mask.float().mean().item())
-            max_dists.append(topk_values.max(dim=1)[0].max().item())
-            
-            # 为每个离散动作a计算 d((a,x̃), (a^e,x^e))
-            # all_continuous_actions: (batch, n_actions, param_dim)
-            # 创建所有离散动作的索引: (batch, n_actions)
-            batch_size = all_continuous_actions.shape[0]
-            n_actions = all_continuous_actions.shape[1]
-            all_discrete_actions = th.arange(n_actions, device=self.device).unsqueeze(0).expand(batch_size, -1)
-            
-            # 使用 _hybrid_act_dist 计算距离 (batch, n_actions)
-            act_dist_all = self._hybrid_act_dist(
-                all_discrete_actions, all_continuous_actions, prop_ids, prop_params
-            )
-            
-            # Apply mask: (batch, n_actions) * (batch, 1) -> (batch, n_actions)
-            masked_dist_all = act_dist_all * valid_mask.unsqueeze(1).float()
+            if self.use_dex_aux_loss:
+                # 计算传播的演示动作: (a^e, x^e)
+                prop_ids, prop_params, topk_values, valid_mask = self._compute_propagated_actions(
+                    replay_data.observations["observation"], demo_obs_t, demo_ids, demo_params
+                )
+                topk_dist_means.append(topk_values.mean().item())
+                valid_ratios.append(valid_mask.float().mean().item())
+                max_dists.append(topk_values.max(dim=1)[0].max().item())
+
+                # 为每个离散动作a计算 d((a,x̃), (a^e,x^e))
+                # all_continuous_actions: (batch, n_actions, param_dim)
+                # 创建所有离散动作的索引: (batch, n_actions)
+                batch_size = all_continuous_actions.shape[0]
+                n_actions = all_continuous_actions.shape[1]
+                all_discrete_actions = th.arange(n_actions, device=self.device).unsqueeze(0).expand(batch_size, -1)
+
+                # 使用 _hybrid_act_dist 计算距离 (batch, n_actions)
+                act_dist_all = self._hybrid_act_dist(
+                    all_discrete_actions, all_continuous_actions, prop_ids, prop_params
+                )
+
+                # Apply mask: (batch, n_actions) * (batch, 1) -> (batch, n_actions)
+                masked_dist_all = act_dist_all * valid_mask.unsqueeze(1).float()
+            else:
+                masked_dist_all = th.zeros_like(all_q_values)
 
             # 计算加权损失: L_π = E[Σ_a π_tsk(a|s)[...]]
             weighted_loss = task_probs * (
@@ -557,8 +576,35 @@ class HSAC_DEX(HSAC):
             actor_loss = weighted_loss.sum(dim=1).mean()
             actor_losses.append(actor_loss.item())
 
+            bc_loss = th.tensor(0.0, device=self.device)
+            if self.use_bc_loss and demo_replay_batch > 0:
+                if replay_batch > 0:
+                    demo_slice = slice(replay_batch, replay_batch + demo_replay_batch)
+                else:
+                    demo_slice = slice(0, demo_replay_batch)
+
+                demo_obs_for_bc = {
+                    key: replay_data.observations[key][demo_slice]
+                    for key in replay_data.observations.keys()
+                }
+                demo_target_ids = replay_data.actions[self.d_key][demo_slice].long().view(-1)
+                demo_target_params = replay_data.actions[self.c_key][demo_slice]
+
+                demo_pred_actions, _, _ = self.actor.forward(demo_obs_for_bc, deterministic=True)
+                demo_pred_ids = demo_pred_actions[self.d_key].long().view(-1)
+                demo_pred_params = demo_pred_actions[self.c_key]
+
+                pred_id_oh = F.one_hot(demo_pred_ids, num_classes=self.actor.n_discrete_actions).float()
+                target_id_oh = F.one_hot(demo_target_ids, num_classes=self.actor.n_discrete_actions).float()
+                bc_id_loss = F.mse_loss(pred_id_oh, target_id_oh)
+                bc_param_loss = F.mse_loss(demo_pred_params, demo_target_params)
+                bc_loss = bc_id_loss + bc_param_loss
+
+            bc_losses.append(bc_loss.item())
+            actor_total_loss = actor_loss + self.demo_bc_weight * bc_loss
+
             self.actor.optimizer.zero_grad()
-            actor_loss.backward()
+            actor_total_loss.backward()
             
             # Compute gradient norm before clipping
             # debug
@@ -602,6 +648,7 @@ class HSAC_DEX(HSAC):
         self.logger.record("train/ent_coef_task", float(np.mean(ent_coefs_task)) if ent_coefs_task else 0.0)
         self.logger.record("train/ent_coef_param", float(np.mean(ent_coefs_param)) if ent_coefs_param else 0.0)
         self.logger.record("train/actor_loss", float(np.mean(actor_losses)) if actor_losses else 0.0)
+        self.logger.record("train/bc_loss", float(np.mean(bc_losses)) if bc_losses else 0.0)
         self.logger.record("train/critic_loss", float(np.mean(critic_losses)) if critic_losses else 0.0)
         if len(ent_coef_task_losses) > 0:
             self.logger.record("train/ent_coef_task_loss", float(np.mean(ent_coef_task_losses)))
