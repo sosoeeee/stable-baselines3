@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 
 import torch as th
 from torch.nn import functional as F
+import time
 
 from stable_baselines3.hsac import HSAC
 from stable_baselines3.common.utils import polyak_update
@@ -24,6 +25,7 @@ class HSAC_DEX(HSAC):
         demo_batch_size: int = 256,
         demo_aux_weight: float = 1.0,
         use_dex_aux_loss: bool = True,
+        use_timing_profile: bool = False,
         demo_bc_weight: float = 1.0,
         use_bc_loss: bool = True,
         replay_demo_ratio: float = 0.0,
@@ -42,6 +44,7 @@ class HSAC_DEX(HSAC):
         self.demo_batch_size = demo_batch_size
         self.demo_aux_weight = demo_aux_weight
         self.use_dex_aux_loss = use_dex_aux_loss
+        self.use_timing_profile = use_timing_profile
         self.demo_bc_weight = demo_bc_weight
         self.use_bc_loss = use_bc_loss
         self.replay_demo_ratio = replay_demo_ratio
@@ -61,6 +64,7 @@ class HSAC_DEX(HSAC):
         self._task_entropy_change_rate: Optional[float] = 0.0
         self._accumulated_task_entropy: float = 0.0  # 累积的熵值
         self._accumulated_entropy_samples: int = 0  # 累积的样本数
+        self._timing_snapshot: Optional[dict] = None
         self.target_q_clip = target_q_clip
         super().__init__(*args, **kwargs)
 
@@ -260,6 +264,9 @@ class HSAC_DEX(HSAC):
         ent_coef_task_losses, ent_coef_param_losses = [], []
         ent_coefs_task, ent_coefs_param = [], []
         actor_losses, critic_losses = [], []
+        # timing accumulators
+        sample_times, forward_times, critic_times, actor_times = [], [], [], []
+        target_times, entropy_times, dex_times, bc_times, polyak_times = [], [], [], [], []
         bc_losses = []
         
         # debug
@@ -303,10 +310,15 @@ class HSAC_DEX(HSAC):
             if demo_replay_batch > 0 and self._demo_buffer is None:
                 raise RuntimeError("demo_path must be provided when replay_demo_ratio > 0")
 
+            # sampling phase
+            if self.use_timing_profile:
+                sample_start = time.perf_counter()
             if replay_batch > 0:
                 replay_part = self.replay_buffer.sample(replay_batch, env=self._vec_normalize_env)  # type: ignore[union-attr]
             if demo_replay_batch > 0:
                 demo_part = self._demo_buffer.sample(demo_replay_batch, env=self._vec_normalize_env)
+            if self.use_timing_profile:
+                sample_times.append(time.perf_counter() - sample_start)
 
             if replay_batch == 0:
                 replay_data = demo_part
@@ -333,10 +345,14 @@ class HSAC_DEX(HSAC):
 
             # Single forward pass: Use evaluate_all_actions for current state
             # This computes task distribution, all continuous actions, and log probs in one pass
+            if self.use_timing_profile:
+                forward_start = time.perf_counter()
             (task_probs, task_log_probs, task_entropy, 
              all_continuous_actions, all_continuous_log_probs) = self.actor.evaluate_all_actions(
                 replay_data.observations
             )
+            if self.use_timing_profile:
+                forward_times.append(time.perf_counter() - forward_start)
             
             task_entropy_mean = task_entropy.mean().item()
             task_entropys.append(task_entropy_mean)
@@ -344,7 +360,12 @@ class HSAC_DEX(HSAC):
             # 累积熵值，用于后续更新EMA
             self._accumulated_task_entropy += task_entropy_mean
             self._accumulated_entropy_samples += 1
-            
+
+            # Timing: entropy coefficient updates
+            ent_coef_start = None
+            if self.use_timing_profile:
+                ent_coef_start = time.perf_counter()
+
             if self.ent_coef_task_optimizer is not None and self.log_ent_coef_task is not None:
                 ent_coef_task = th.exp(self.log_ent_coef_task.detach())
                 
@@ -409,6 +430,13 @@ class HSAC_DEX(HSAC):
                 self.ent_coef_param_optimizer.zero_grad()
                 ent_coef_param_loss.backward()
                 self.ent_coef_param_optimizer.step()
+
+            if self.use_timing_profile and ent_coef_start is not None:
+                entropy_times.append(time.perf_counter() - ent_coef_start)
+
+            target_start = None
+            if self.use_timing_profile:
+                target_start = time.perf_counter()
 
             with th.no_grad():
                 # Use evaluate_all_actions for next state (with param_mask applied)
@@ -476,6 +504,9 @@ class HSAC_DEX(HSAC):
                 target_q_Pent_means.append(Pent.mean().item())
                 target_q_dex_mins.append(dex.min().item())
 
+            if self.use_timing_profile and target_start is not None:
+                target_times.append(time.perf_counter() - target_start)
+
             current_q_values = self.critic(replay_data.observations, replay_data.actions)
             critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
             # change to Huber Loss (less sensitive to outliers that HER creates)
@@ -490,6 +521,8 @@ class HSAC_DEX(HSAC):
             # 记录当前 batch 的 reward 最大值
             reward_maxs.append(replay_data.rewards.max().item())
 
+            if self.use_timing_profile:
+                critic_start = time.perf_counter()
             self.critic.optimizer.zero_grad()
             critic_loss.backward()
             
@@ -532,12 +565,18 @@ class HSAC_DEX(HSAC):
             th.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=10.0)
             
             self.critic.optimizer.step()
+            if self.use_timing_profile:
+                critic_times.append(time.perf_counter() - critic_start)
 
             # Actor loss uses evaluate_all_actions results computed above
             # No need to re-evaluate since entropy coef losses used .detach()
 
             # Compute Q-values for all discrete actions using min over all critics
             all_q_values = self.critic.forward_all_discrete(replay_data.observations, all_continuous_actions)
+
+            dex_start = None
+            if self.use_timing_profile and self.use_dex_aux_loss:
+                dex_start = time.perf_counter()
 
             if self.use_dex_aux_loss:
                 # 计算传播的演示动作: (a^e, x^e)
@@ -565,6 +604,9 @@ class HSAC_DEX(HSAC):
             else:
                 masked_dist_all = th.zeros_like(all_q_values)
 
+            if self.use_timing_profile and dex_start is not None:
+                dex_times.append(time.perf_counter() - dex_start)
+
             # 计算加权损失: L_π = E[Σ_a π_tsk(a|s)[...]]
             weighted_loss = task_probs * (
                 ent_coef_task * task_log_probs +
@@ -577,6 +619,10 @@ class HSAC_DEX(HSAC):
             actor_losses.append(actor_loss.item())
 
             bc_loss = th.tensor(0.0, device=self.device)
+            bc_start = None
+            if self.use_timing_profile and self.use_bc_loss and demo_replay_batch > 0:
+                bc_start = time.perf_counter()
+
             if self.use_bc_loss and demo_replay_batch > 0:
                 if replay_batch > 0:
                     demo_slice = slice(replay_batch, replay_batch + demo_replay_batch)
@@ -600,9 +646,14 @@ class HSAC_DEX(HSAC):
                 bc_param_loss = F.mse_loss(demo_pred_params, demo_target_params)
                 bc_loss = bc_id_loss + bc_param_loss
 
+            if self.use_timing_profile and bc_start is not None:
+                bc_times.append(time.perf_counter() - bc_start)
+
             bc_losses.append(bc_loss.item())
             actor_total_loss = actor_loss + self.demo_bc_weight * bc_loss
 
+            if self.use_timing_profile:
+                actor_start = time.perf_counter()
             self.actor.optimizer.zero_grad()
             actor_total_loss.backward()
             
@@ -619,10 +670,19 @@ class HSAC_DEX(HSAC):
             actor_grad_norms.append(actor_grad_norm_before_clip)
             
             self.actor.optimizer.step()
+            if self.use_timing_profile:
+                actor_times.append(time.perf_counter() - actor_start)
 
             if gradient_step % self.target_update_interval == 0:
+                polyak_start = None
+                if self.use_timing_profile:
+                    polyak_start = time.perf_counter()
+
                 polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
                 polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
+
+                if self.use_timing_profile and polyak_start is not None:
+                    polyak_times.append(time.perf_counter() - polyak_start)
 
         # 每隔 entropy_update_interval 次 train() 调用更新一次 EMA
         self._train_call_count += 1
@@ -650,6 +710,42 @@ class HSAC_DEX(HSAC):
         self.logger.record("train/actor_loss", float(np.mean(actor_losses)) if actor_losses else 0.0)
         self.logger.record("train/bc_loss", float(np.mean(bc_losses)) if bc_losses else 0.0)
         self.logger.record("train/critic_loss", float(np.mean(critic_losses)) if critic_losses else 0.0)
+        if self.use_timing_profile:
+            sample_time = float(np.mean(sample_times)) if sample_times else 0.0
+            forward_time = float(np.mean(forward_times)) if forward_times else 0.0
+            critic_time = float(np.mean(critic_times)) if critic_times else 0.0
+            actor_time = float(np.mean(actor_times)) if actor_times else 0.0
+            target_time = float(np.mean(target_times)) if target_times else 0.0
+            entropy_time = float(np.mean(entropy_times)) if entropy_times else 0.0
+            dex_time = float(np.mean(dex_times)) if dex_times else 0.0
+            bc_time = float(np.mean(bc_times)) if bc_times else 0.0
+            polyak_time = float(np.mean(polyak_times)) if polyak_times else 0.0
+
+            self.logger.record("time/sample", sample_time)
+            self.logger.record("time/forward", forward_time)
+            self.logger.record("time/critic", critic_time)
+            self.logger.record("time/actor", actor_time)
+            self.logger.record("time/target", target_time)
+            self.logger.record("time/entropy", entropy_time)
+            self.logger.record("time/dex", dex_time)
+            self.logger.record("time/bc", bc_time)
+            self.logger.record("time/polyak", polyak_time)
+            # Keep a stable copy for callbacks/scripts that read after logger flush.
+            self._timing_snapshot = {
+                "num_timesteps": int(self.num_timesteps),
+                "sample_time": sample_time,
+                "forward_time": forward_time,
+                "critic_time": critic_time,
+                "actor_time": actor_time,
+                "target_time": target_time,
+                "entropy_time": entropy_time,
+                "dex_time": dex_time,
+                "bc_time": bc_time,
+                "polyak_time": polyak_time,
+                "actor_loss": float(np.mean(actor_losses)) if actor_losses else 0.0,
+                "critic_loss": float(np.mean(critic_losses)) if critic_losses else 0.0,
+                "bc_loss": float(np.mean(bc_losses)) if bc_losses else 0.0,
+            }
         if len(ent_coef_task_losses) > 0:
             self.logger.record("train/ent_coef_task_loss", float(np.mean(ent_coef_task_losses)))
         if len(ent_coef_param_losses) > 0:
