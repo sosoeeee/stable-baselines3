@@ -636,14 +636,18 @@ class HSAC_DEX(HSAC):
                 demo_target_ids = replay_data.actions[self.d_key][demo_slice].long().view(-1)
                 demo_target_params = replay_data.actions[self.c_key][demo_slice]
 
-                demo_pred_actions, _, _ = self.actor.forward(demo_obs_for_bc, deterministic=True)
-                demo_pred_ids = demo_pred_actions[self.d_key].long().view(-1)
-                demo_pred_params = demo_pred_actions[self.c_key]
+                # Use logits CE for discrete BC so gradients flow through the task policy.
+                demo_task_logits = self.actor.get_task_dist_params(demo_obs_for_bc)
+                bc_id_loss = F.cross_entropy(demo_task_logits, demo_target_ids)
 
-                pred_id_oh = F.one_hot(demo_pred_ids, num_classes=self.actor.n_discrete_actions).float()
-                target_id_oh = F.one_hot(demo_target_ids, num_classes=self.actor.n_discrete_actions).float()
-                bc_id_loss = F.mse_loss(pred_id_oh, target_id_oh)
-                bc_param_loss = F.mse_loss(demo_pred_params, demo_target_params)
+                # Regress continuous params conditioned on target discrete action.
+                demo_mean_actions, _, _ = self.actor.get_param_dist_params(demo_obs_for_bc, demo_target_ids)
+                demo_mask = self.actor.param_mask[demo_target_ids.long()]
+                demo_pred_params = th.tanh(demo_mean_actions)
+                # Normalize masked MSE by each sample's valid parameter dims to avoid scale bias.
+                param_sq_error = (demo_pred_params - demo_target_params).pow(2) * demo_mask
+                valid_dims = demo_mask.sum(dim=1).clamp_min(1.0)
+                bc_param_loss = (param_sq_error.sum(dim=1) / valid_dims).mean()
                 bc_loss = bc_id_loss + bc_param_loss
 
             if self.use_timing_profile and bc_start is not None:
