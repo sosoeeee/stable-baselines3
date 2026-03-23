@@ -282,8 +282,7 @@ class HybridActor(BasePolicy):
         if deterministic:
             discrete_action = th.argmax(task_dist.probs, dim=1)
         else:
-            # Epsilon-greedy exploration for discrete actions
-            batch_size = obs.shape[0] if isinstance(obs, th.Tensor) else obs['observation'].shape[0]
+            batch_size = obs.shape[0] if isinstance(obs, th.Tensor) else next(iter(obs.values())).shape[0]
             
             # Sample from uniform distribution with probability epsilon
             if self.discrete_epsilon > 0:
