@@ -12,7 +12,14 @@ from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
-from stable_baselines3.hsac.policies import HybridActor, HybridCritic, HybridSACPolicy, MlpPolicy, MultiInputPolicy
+from stable_baselines3.hsac.policies import (
+    FiLMMultiInputPolicy,
+    HybridActor,
+    HybridCritic,
+    HybridSACPolicy,
+    MlpPolicy,
+    MultiInputPolicy,
+)
 from stable_baselines3.common.buffers import HybridReplayBuffer
 
 SelfHSAC = TypeVar("SelfHSAC", bound="HSAC")
@@ -60,6 +67,7 @@ class HSAC(OffPolicyAlgorithm):
     policy_aliases: ClassVar[Dict[str, Type[BasePolicy]]] = {
         "MlpPolicy": MlpPolicy,
         "MultiInputPolicy": MultiInputPolicy,
+        "FiLMMultiInputPolicy": FiLMMultiInputPolicy,
     }
     policy: HybridSACPolicy
     actor: HybridActor
@@ -488,6 +496,13 @@ class HSAC(OffPolicyAlgorithm):
             self.logger.record("diagnostic/actor_max_param", float(np.mean(actor_param_max_abs)))
         if critic_param_max_abs:
             self.logger.record("diagnostic/critic_max_param", float(np.mean(critic_param_max_abs)))
+
+        # Log FiLM internals when using FiLM feature extractor.
+        actor_extractor = getattr(self.actor, "features_extractor", None)
+        if actor_extractor is not None and hasattr(actor_extractor, "get_film_stats"):
+            film_stats = actor_extractor.get_film_stats()
+            for key, value in film_stats.items():
+                self.logger.record(key, float(value))
 
     def learn(
         self: SelfHSAC,

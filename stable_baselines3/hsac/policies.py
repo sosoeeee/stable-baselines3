@@ -915,6 +915,107 @@ class HybridSACPolicy(BasePolicy):
             return restored_actions
 
 
+class FiLMHITLExtractor(BaseFeaturesExtractor):
+    """FiLM feature extractor for HITL_PegTransfer-style dict observations."""
+
+    def __init__(
+        self,
+        observation_space: spaces.Dict,
+        hidden_dim: int = 256,
+        cond_dim: int = 7,
+        obs_key: str = "observation",
+        achieved_key: str = "achieved_goal",
+        desired_key: str = "desired_goal",
+    ):
+        assert isinstance(observation_space, spaces.Dict), "FiLMHITLExtractor requires Dict observation space"
+        assert obs_key in observation_space.spaces, f"Missing key in observation space: {obs_key}"
+        assert achieved_key in observation_space.spaces, f"Missing key in observation space: {achieved_key}"
+        assert desired_key in observation_space.spaces, f"Missing key in observation space: {desired_key}"
+
+        self.obs_key = obs_key
+        self.achieved_key = achieved_key
+        self.desired_key = desired_key
+        self.cond_dim = cond_dim
+
+        obs_dim = int(np.prod(observation_space.spaces[obs_key].shape))
+        achieved_dim = int(np.prod(observation_space.spaces[achieved_key].shape))
+        desired_dim = int(np.prod(observation_space.spaces[desired_key].shape))
+        assert obs_dim > cond_dim, f"obs_dim ({obs_dim}) must be > cond_dim ({cond_dim})"
+
+        state_obs_dim = obs_dim - cond_dim
+        self.state_in_dim = state_obs_dim + achieved_dim + desired_dim
+
+        super().__init__(observation_space, features_dim=hidden_dim)
+
+        # State stream: fully connected layers with ReLU after each layer.
+        self.state_mlp = nn.Sequential(
+            nn.Linear(self.state_in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+
+        # Conditioning stream: fully connected layers with ReLU after each layer.
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(cond_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+
+        # FiLM heads for a single modulation stage.
+        self.gamma = nn.Linear(hidden_dim, hidden_dim)
+        self.beta = nn.Linear(hidden_dim, hidden_dim)
+
+        # Near-identity FiLM init improves early training stability.
+        nn.init.zeros_(self.gamma.weight)
+        nn.init.ones_(self.gamma.bias)
+        nn.init.zeros_(self.beta.weight)
+        nn.init.zeros_(self.beta.bias)
+
+        # Runtime stats for external logging (updated every forward call).
+        self.last_gamma_mean = 1.0
+        self.last_beta_mean = 0.0
+
+    def forward(self, observations: Dict[str, th.Tensor]) -> th.Tensor:
+        obs_vec = observations[self.obs_key]
+        cond = obs_vec[:, -self.cond_dim :]
+        state_main = obs_vec[:, :-self.cond_dim]
+
+        x_state = th.cat(
+            [
+                state_main,
+                observations[self.achieved_key],
+                observations[self.desired_key],
+            ],
+            dim=1,
+        )
+
+        c = self.cond_mlp(cond)
+
+        h = self.state_mlp(x_state)
+        gamma = self.gamma(c)
+        beta = self.beta(c)
+        modulated = gamma * h + beta
+        h = F.relu(modulated)
+
+        with th.no_grad():
+            self.last_gamma_mean = float(gamma.mean().item())
+            self.last_beta_mean = float(beta.mean().item())
+
+        return h
+
+    def get_film_stats(self) -> Dict[str, float]:
+        return {
+            "film/gamma_mean": self.last_gamma_mean,
+            "film/beta_mean": self.last_beta_mean,
+        }
+
+
 class MultiInputPolicy(HybridSACPolicy):
     """
     Policy class (with both actor and critic) for HybridSAC.
@@ -963,6 +1064,53 @@ class MultiInputPolicy(HybridSACPolicy):
         discrete_epsilon: float = 0.0,
         param_mask: Optional[np.ndarray] = None,
     ):
+        super().__init__(
+            observation_space,
+            action_space,
+            lr_schedule,
+            net_arch,
+            activation_fn,
+            use_sde,
+            features_extractor_class,
+            features_extractor_kwargs,
+            normalize_images,
+            optimizer_class,
+            optimizer_kwargs,
+            n_critics,
+            d_key,
+            c_key,
+            share_features_extractor,
+            discrete_epsilon,
+            param_mask,
+        )
+
+
+class FiLMMultiInputPolicy(HybridSACPolicy):
+    """HybridSAC policy that uses FiLMHITLExtractor by default."""
+
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Dict,
+        lr_schedule: Schedule,
+        net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
+        activation_fn: Type[nn.Module] = nn.ReLU,
+        use_sde: bool = False,
+        features_extractor_class: Type[BaseFeaturesExtractor] = FiLMHITLExtractor,
+        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+        normalize_images: bool = True,
+        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        n_critics: int = 2,
+        d_key: str = "discrete",
+        c_key: str = "continuous",
+        share_features_extractor: bool = False,
+        discrete_epsilon: float = 0.0,
+        param_mask: Optional[np.ndarray] = None,
+    ):
+        if features_extractor_kwargs is None:
+            features_extractor_kwargs = {"hidden_dim": 256, "cond_dim": 7}
+
         super().__init__(
             observation_space,
             action_space,

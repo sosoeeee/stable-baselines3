@@ -799,6 +799,13 @@ class HSAC_DEX(HSAC):
             self.logger.record("diagnostic/max_desired_goal_val", float(np.mean(max_desired_goal_val_list)))
         if max_achieved_goal_val_list:
             self.logger.record("diagnostic/max_achieved_goal_val", float(np.mean(max_achieved_goal_val_list)))
+
+        # Log FiLM internals when using FiLM feature extractor.
+        actor_extractor = getattr(self.actor, "features_extractor", None)
+        if actor_extractor is not None and hasattr(actor_extractor, "get_film_stats"):
+            film_stats = actor_extractor.get_film_stats()
+            for key, value in film_stats.items():
+                self.logger.record(key, float(value))
         
         # self.logger.record("train/demo_k", self.demo_k)
         # self.logger.record("train/demo_id_margin", self.demo_id_margin)
