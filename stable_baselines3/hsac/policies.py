@@ -631,6 +631,7 @@ class HybridSACPolicy(BasePolicy):
         share_features_extractor: bool = False,
         discrete_epsilon: float = 0.0,
         param_mask: Optional[np.ndarray] = None,
+        freeze_state_and_post_mlp: bool = False,
     ):
         super().__init__(
             observation_space,
@@ -648,6 +649,7 @@ class HybridSACPolicy(BasePolicy):
         self.c_key = c_key
         self.discrete_epsilon = discrete_epsilon
         self.param_mask = param_mask
+        self.freeze_state_and_post_mlp = freeze_state_and_post_mlp
         
         # Get parameters from action space
         assert isinstance(action_space, spaces.Dict), "Action space must be Dict"
@@ -700,15 +702,51 @@ class HybridSACPolicy(BasePolicy):
 
         self._build(lr_schedule)
 
+    @staticmethod
+    def _set_module_requires_grad(module: Optional[nn.Module], requires_grad: bool) -> None:
+        if module is None:
+            return
+        for param in module.parameters():
+            param.requires_grad = requires_grad
+
+    def _set_extractor_condition_only_trainable(self, extractor: Optional[nn.Module]) -> None:
+        if extractor is None:
+            return
+
+        # Freeze the state stream, keep conditioning path trainable.
+        if hasattr(extractor, "state_mlp"):
+            self._set_module_requires_grad(getattr(extractor, "state_mlp"), False)
+        if hasattr(extractor, "cond_mlp"):
+            self._set_module_requires_grad(getattr(extractor, "cond_mlp"), True)
+        if hasattr(extractor, "gamma"):
+            self._set_module_requires_grad(getattr(extractor, "gamma"), True)
+        if hasattr(extractor, "beta"):
+            self._set_module_requires_grad(getattr(extractor, "beta"), True)
+
+    def _apply_condition_only_freeze(self) -> None:
+        if not self.freeze_state_and_post_mlp:
+            return
+
+        # Actor: freeze latent heads after extractor; keep conditioning extractor trainable.
+        self._set_extractor_condition_only_trainable(getattr(self.actor, "features_extractor", None))
+        self._set_module_requires_grad(getattr(self.actor, "task_latent", None), False)
+        self._set_module_requires_grad(getattr(self.actor, "task_logits", None), False)
+        for module_dict in getattr(self.actor, "param_networks", []):
+            self._set_module_requires_grad(module_dict, False)
+
+        # Critic: freeze post-feature Q MLP(s); keep conditioning extractor trainable.
+        self._set_extractor_condition_only_trainable(getattr(self.critic, "features_extractor", None))
+        for q_net in getattr(self.critic, "q_networks", []):
+            self._set_module_requires_grad(q_net, False)
+
+        self._set_extractor_condition_only_trainable(getattr(self.critic_target, "features_extractor", None))
+        for q_net in getattr(self.critic_target, "q_networks", []):
+            self._set_module_requires_grad(q_net, False)
+
     def _build(self, lr_schedule: Schedule) -> None:
         """Build networks."""
         # Create actor
         self.actor = self.make_actor()
-        self.actor.optimizer = self.optimizer_class(
-            self.actor.parameters(),
-            lr=lr_schedule(1),
-            **self.optimizer_kwargs,
-        )
 
         # Create critics (Q-networks)
         if self.share_features_extractor:
@@ -724,6 +762,14 @@ class HybridSACPolicy(BasePolicy):
 
         self.critic_target = self.make_critic(features_extractor=None)
         self.critic_target.load_state_dict(self.critic.state_dict())
+
+        self._apply_condition_only_freeze()
+
+        self.actor.optimizer = self.optimizer_class(
+            self.actor.parameters(),
+            lr=lr_schedule(1),
+            **self.optimizer_kwargs,
+        )
         
         self.critic.optimizer = self.optimizer_class(
             critic_parameters,
@@ -921,7 +967,7 @@ class FiLMHITLExtractor(BaseFeaturesExtractor):
     def __init__(
         self,
         observation_space: spaces.Dict,
-        hidden_dim: int = 256,
+        hidden_dim: int = 128,
         cond_dim: int = 7,
         obs_key: str = "observation",
         achieved_key: str = "achieved_goal",
@@ -947,21 +993,17 @@ class FiLMHITLExtractor(BaseFeaturesExtractor):
 
         super().__init__(observation_space, features_dim=hidden_dim)
 
-        # State stream: fully connected layers with ReLU after each layer.
+        # State stream
         self.state_mlp = nn.Sequential(
             nn.Linear(self.state_in_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
         )
 
-        # Conditioning stream: fully connected layers with ReLU after each layer.
+        # Conditioning stream
         self.cond_mlp = nn.Sequential(
             nn.Linear(cond_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -1063,6 +1105,7 @@ class MultiInputPolicy(HybridSACPolicy):
         share_features_extractor: bool = False,
         discrete_epsilon: float = 0.0,
         param_mask: Optional[np.ndarray] = None,
+        freeze_state_and_post_mlp: bool = False,
     ):
         super().__init__(
             observation_space,
@@ -1082,6 +1125,7 @@ class MultiInputPolicy(HybridSACPolicy):
             share_features_extractor,
             discrete_epsilon,
             param_mask,
+            freeze_state_and_post_mlp,
         )
 
 
@@ -1107,6 +1151,7 @@ class FiLMMultiInputPolicy(HybridSACPolicy):
         share_features_extractor: bool = False,
         discrete_epsilon: float = 0.0,
         param_mask: Optional[np.ndarray] = None,
+        freeze_state_and_post_mlp: bool = False,
     ):
         if features_extractor_kwargs is None:
             features_extractor_kwargs = {"hidden_dim": 256, "cond_dim": 7}
@@ -1129,6 +1174,7 @@ class FiLMMultiInputPolicy(HybridSACPolicy):
             share_features_extractor,
             discrete_epsilon,
             param_mask,
+            freeze_state_and_post_mlp,
         )
 
 # Alias for compatibility
