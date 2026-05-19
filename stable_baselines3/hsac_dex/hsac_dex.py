@@ -23,16 +23,30 @@ class HSAC_DEX(HSAC):
         *args,
         demo_path: Optional[str] = None,
         demo_batch_size: int = 256,
+        # Separate demo source for human-style fine-tuning (kept independent from demo_path)
+        finetune_demo_path: Optional[str] = None,
+        # Human-style fine-tuning controls (all OFF by default for backward compatibility)
+        use_finetune_demo_for_bc: bool = False,
+        weight_bc_id: Optional[float] = None,
+        weight_bc_param: Optional[float] = None,
+        use_q_filter: bool = False,
+        q_filter_margin: float = 0.0,
+        q_filter_use_target: bool = True,
+        q_filter_deterministic_pi: bool = True,
+        # Whether to update VecNormalize stats from finetune demos (default OFF to avoid side effects)
+        finetune_update_vecnormalize_stats: bool = False,
         demo_aux_weight: float = 1.0,
         use_dex_aux_loss: bool = True,
         use_timing_profile: bool = False,
         demo_bc_weight: float = 1.0,
         use_bc_loss: bool = True,
+        finetune_demo_batch_size: int = 256,
         replay_demo_ratio: float = 0.0,
         demo_k: int = 5,
         demo_id_margin: float = 1.0,
         demo_dist_threshold: float = 2.0,
         demo_buffer_kwargs: Optional[dict] = None,
+        finetune_demo_buffer_kwargs: Optional[dict] = None,
         entropy_ema_alpha: float = 0.1,             # EMA平滑系数，越小越平滑
         entropy_change_threshold: float = 0.002,    # 熵变化率阈值，超过此值认为"显著上升"
         entropy_update_interval: int = 10,          # 每隔多少次train()调用更新一次EMA
@@ -41,18 +55,30 @@ class HSAC_DEX(HSAC):
         **kwargs,
     ):
         self.demo_path = demo_path
+        self.finetune_demo_path = finetune_demo_path
         self.demo_batch_size = demo_batch_size
+        self.finetune_demo_batch_size = finetune_demo_batch_size
         self.demo_aux_weight = demo_aux_weight
         self.use_dex_aux_loss = use_dex_aux_loss
         self.use_timing_profile = use_timing_profile
         self.demo_bc_weight = demo_bc_weight
         self.use_bc_loss = use_bc_loss
+        self.use_finetune_demo_for_bc = use_finetune_demo_for_bc
+        self.weight_bc_id = weight_bc_id
+        self.weight_bc_param = weight_bc_param
+        self.use_q_filter = use_q_filter
+        self.q_filter_margin = q_filter_margin
+        self.q_filter_use_target = q_filter_use_target
+        self.q_filter_deterministic_pi = q_filter_deterministic_pi
+        self.finetune_update_vecnormalize_stats = finetune_update_vecnormalize_stats
         self.replay_demo_ratio = replay_demo_ratio
         self.demo_k = demo_k
         self.demo_id_margin = demo_id_margin
         self.demo_dist_threshold = demo_dist_threshold
         self.demo_buffer_kwargs = demo_buffer_kwargs or {}
+        self.finetune_demo_buffer_kwargs = finetune_demo_buffer_kwargs
         self._demo_buffer: Optional[DemoBuffer] = None
+        self._finetune_demo_buffer: Optional[DemoBuffer] = None
         # control the entropy coef of discrete action
         self.max_entropy_weighted = max_entropy_weighted
         self.entropy_ema_alpha = entropy_ema_alpha
@@ -114,6 +140,38 @@ class HSAC_DEX(HSAC):
                         print(f"  ✓ Updated reward statistics from {demo_size} demo transitions")
 
                     print("✓ VecNormalize statistics updated with demonstration data\n")
+
+        # Optional: load a separate demo buffer for human-style fine-tuning.
+        # By default, this has NO side effects on training unless explicitly used.
+        if self.finetune_demo_path is not None:
+            finetune_kwargs = dict(self.finetune_demo_buffer_kwargs or self.demo_buffer_kwargs)
+            finetune_kwargs.setdefault("env", self.env)
+            self._finetune_demo_buffer = DemoBuffer.from_npz(
+                path=self.finetune_demo_path,
+                observation_space=self.observation_space,
+                action_space=self.action_space,
+                device=self.device,
+                **finetune_kwargs,
+            )
+            self.finetune_demo_batch_size = min(self.finetune_demo_batch_size, self._finetune_demo_buffer.size())
+
+            if self.finetune_update_vecnormalize_stats:
+                finetune_size = self._finetune_demo_buffer.pos
+                vec_normalize = unwrap_vec_normalize(self.env)
+                if vec_normalize is not None and finetune_size > 0:
+                    print("Updating VecNormalize statistics with finetune demonstration data...")
+                    if vec_normalize.norm_obs:
+                        finetune_obs = {
+                            key: self._finetune_demo_buffer.observations[key][:finetune_size].copy()
+                            for key in self._finetune_demo_buffer.observations
+                        }
+                        vec_normalize.update_from_data(observations=finetune_obs, rewards=None)
+                        print(f"  ✓ Updated observation statistics from {finetune_size} finetune demo transitions")
+                    if vec_normalize.norm_reward:
+                        finetune_rewards = self._finetune_demo_buffer.rewards[:finetune_size].copy()
+                        vec_normalize.update_from_data(observations=None, rewards=finetune_rewards)
+                        print(f"  ✓ Updated reward statistics from {finetune_size} finetune demo transitions")
+                    print("✓ VecNormalize statistics updated with finetune demonstrations\n")
 
 
     def _compute_propagated_actions(
@@ -268,6 +326,9 @@ class HSAC_DEX(HSAC):
         sample_times, forward_times, critic_times, actor_times = [], [], [], []
         target_times, entropy_times, dex_times, bc_times, polyak_times = [], [], [], [], []
         bc_losses = []
+        bc_id_losses = []
+        bc_param_losses = []
+        q_filter_pass_ratios = []
         
         # debug
         dist_losses = []
@@ -619,9 +680,135 @@ class HSAC_DEX(HSAC):
             actor_losses.append(actor_loss.item())
 
             bc_loss = th.tensor(0.0, device=self.device)
+            bc_loss = th.tensor(0.0, device=self.device)
             bc_start = None
             if self.use_timing_profile and self.use_bc_loss and demo_replay_batch > 0:
                 bc_start = time.perf_counter()
+            # Backward-compatible BC:
+            # - Default behavior (use_finetune_demo_for_bc=False): compute BC only on demo samples mixed into replay batch.
+            # - Finetune behavior (use_finetune_demo_for_bc=True): compute BC on a separate finetune demo buffer.
+            if self.use_bc_loss:
+                use_finetune_bc = bool(self.use_finetune_demo_for_bc)
+                if use_finetune_bc:
+                    if self._finetune_demo_buffer is None:
+                        raise RuntimeError("finetune_demo_path must be provided when use_finetune_demo_for_bc is True")
+
+                    bc_demo_data = self._finetune_demo_buffer.sample(
+                        self.finetune_demo_batch_size,
+                        env=self._vec_normalize_env,
+                    )
+                    demo_obs_for_bc = bc_demo_data.observations
+                    demo_target_ids = bc_demo_data.actions[self.d_key].long().view(-1)
+                    demo_target_params = bc_demo_data.actions[self.c_key]
+
+                    # --- Human-style BC module: split id/param weights + optional Q-filter ---
+                    weight_bc_id = self.weight_bc_id
+                    weight_bc_param = self.weight_bc_param
+                    if weight_bc_id is None and weight_bc_param is None:
+                        # Keep legacy default: demo_bc_weight multiplies total BC.
+                        weight_bc_id = self.demo_bc_weight
+                        weight_bc_param = self.demo_bc_weight
+                    else:
+                        # If only one is provided, default the other to the legacy weight.
+                        if weight_bc_id is None:
+                            weight_bc_id = self.demo_bc_weight
+                        if weight_bc_param is None:
+                            weight_bc_param = self.demo_bc_weight
+
+                    # Discrete BC (per-sample): CE(logits, target_id)
+                    demo_task_logits = self.actor.get_task_dist_params(demo_obs_for_bc)
+                    bc_id_loss_per_sample = F.cross_entropy(
+                        demo_task_logits,
+                        demo_target_ids,
+                        reduction="none",
+                    )  # (n_demo,)
+
+                    # Continuous BC (per-sample): masked MSE normalized by valid dims
+                    demo_mean_actions, _, _ = self.actor.get_param_dist_params(demo_obs_for_bc, demo_target_ids)
+                    demo_mask = self.actor.param_mask[demo_target_ids.long()]
+                    demo_pred_params = th.tanh(demo_mean_actions) * demo_mask
+                    param_sq_error = (demo_pred_params - demo_target_params).pow(2) * demo_mask
+                    valid_dims = demo_mask.sum(dim=1).clamp_min(1.0)
+                    bc_param_loss_per_sample = param_sq_error.sum(dim=1) / valid_dims  # (n_demo,)
+
+                    # Q-filter gating mask (no grad): only imitate demo if its Q is not much worse than policy Q.
+                    if self.use_q_filter:
+                        critic_net = self.critic_target if self.q_filter_use_target else self.critic
+                        with th.no_grad():
+                            # Q(demo)
+                            demo_action_dict = {
+                                self.d_key: demo_target_ids,
+                                self.c_key: demo_target_params,
+                            }
+                            q_demo_tuple = critic_net(demo_obs_for_bc, demo_action_dict)
+                            q_demo = th.min(th.cat(list(q_demo_tuple), dim=1), dim=1, keepdim=True)[0]  # (n_demo, 1)
+
+                            if self.q_filter_deterministic_pi:
+                                # Deterministic pi(s): argmax id + mean params
+                                pi_logits = self.actor.get_task_dist_params(demo_obs_for_bc)
+                                pi_ids = th.argmax(pi_logits, dim=1)
+                                pi_mean_actions, _, _ = self.actor.get_param_dist_params(demo_obs_for_bc, pi_ids)
+                                pi_mask = self.actor.param_mask[pi_ids.long()]
+                                pi_params = th.tanh(pi_mean_actions) * pi_mask
+                                pi_action_dict = {
+                                    self.d_key: pi_ids,
+                                    self.c_key: pi_params,
+                                }
+                            else:
+                                # Stochastic pi(s): sample from current actor
+                                pi_actions, _, _ = self.actor(demo_obs_for_bc, deterministic=False)
+                                pi_action_dict = {
+                                    self.d_key: pi_actions[self.d_key],
+                                    self.c_key: pi_actions[self.c_key],
+                                }
+                            q_pi_tuple = critic_net(demo_obs_for_bc, pi_action_dict)
+                            q_pi = th.min(th.cat(list(q_pi_tuple), dim=1), dim=1, keepdim=True)[0]  # (n_demo, 1)
+
+                            q_filter_mask = (q_demo > (q_pi - float(self.q_filter_margin))).float().squeeze(1)  # (n_demo,)
+                    else:
+                        q_filter_mask = th.ones_like(bc_id_loss_per_sample)
+
+                    bc_id = (bc_id_loss_per_sample * q_filter_mask).mean()
+                    bc_param = (bc_param_loss_per_sample * q_filter_mask).mean()
+                    bc_loss = bc_id + bc_param
+                    bc_id_losses.append(float(bc_id.item()))
+                    bc_param_losses.append(float(bc_param.item()))
+                    q_filter_pass_ratios.append(float(q_filter_mask.mean().item()))
+
+                    actor_total_loss = actor_loss + float(weight_bc_id) * bc_id + float(weight_bc_param) * bc_param
+
+                else:
+                    # Legacy path: only compute BC when demo samples are mixed into replay batch.
+                    if demo_replay_batch > 0:
+                        if replay_batch > 0:
+                            demo_slice = slice(replay_batch, replay_batch + demo_replay_batch)
+                        else:
+                            demo_slice = slice(0, demo_replay_batch)
+
+                        demo_obs_for_bc = {
+                            key: replay_data.observations[key][demo_slice]
+                            for key in replay_data.observations.keys()
+                        }
+                        demo_target_ids = replay_data.actions[self.d_key][demo_slice].long().view(-1)
+                        demo_target_params = replay_data.actions[self.c_key][demo_slice]
+
+                        # Use logits CE for discrete BC so gradients flow through the task policy.
+                        demo_task_logits = self.actor.get_task_dist_params(demo_obs_for_bc)
+                        bc_id_loss = F.cross_entropy(demo_task_logits, demo_target_ids)
+
+                        # Regress continuous params conditioned on target discrete action.
+                        demo_mean_actions, _, _ = self.actor.get_param_dist_params(demo_obs_for_bc, demo_target_ids)
+                        demo_mask = self.actor.param_mask[demo_target_ids.long()]
+                        demo_pred_params = th.tanh(demo_mean_actions)
+                        # Normalize masked MSE by each sample's valid parameter dims to avoid scale bias.
+                        param_sq_error = (demo_pred_params - demo_target_params).pow(2) * demo_mask
+                        valid_dims = demo_mask.sum(dim=1).clamp_min(1.0)
+                        bc_param_loss = (param_sq_error.sum(dim=1) / valid_dims).mean()
+                        bc_loss = bc_id_loss + bc_param_loss
+
+                    actor_total_loss = actor_loss + self.demo_bc_weight * bc_loss
+            else:
+                actor_total_loss = actor_loss
 
             if self.use_bc_loss and demo_replay_batch > 0:
                 if replay_batch > 0:
@@ -713,6 +900,12 @@ class HSAC_DEX(HSAC):
         self.logger.record("train/ent_coef_param", float(np.mean(ent_coefs_param)) if ent_coefs_param else 0.0)
         self.logger.record("train/actor_loss", float(np.mean(actor_losses)) if actor_losses else 0.0)
         self.logger.record("train/bc_loss", float(np.mean(bc_losses)) if bc_losses else 0.0)
+        if bc_id_losses:
+            self.logger.record("train/bc_id_loss", float(np.mean(bc_id_losses)))
+        if bc_param_losses:
+            self.logger.record("train/bc_param_loss", float(np.mean(bc_param_losses)))
+        if q_filter_pass_ratios:
+            self.logger.record("train/q_filter_pass_ratio", float(np.mean(q_filter_pass_ratios)))
         self.logger.record("train/critic_loss", float(np.mean(critic_losses)) if critic_losses else 0.0)
         if self.use_timing_profile:
             sample_time = float(np.mean(sample_times)) if sample_times else 0.0
