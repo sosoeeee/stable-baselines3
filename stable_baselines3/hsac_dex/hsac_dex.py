@@ -679,17 +679,19 @@ class HSAC_DEX(HSAC):
             actor_loss = weighted_loss.sum(dim=1).mean()
             actor_losses.append(actor_loss.item())
 
-            bc_loss = th.tensor(0.0, device=self.device)
+            # BC is now reserved for human-style fine-tuning only.
+            # Legacy BC on replay-mixed demo slices has been removed intentionally.
             bc_loss = th.tensor(0.0, device=self.device)
             bc_start = None
-            if self.use_timing_profile and self.use_bc_loss and demo_replay_batch > 0:
+            if self.use_bc_loss and not self.use_finetune_demo_for_bc:
+                raise RuntimeError(
+                    "Legacy BC has been disabled. To use BC, set use_finetune_demo_for_bc=True and provide finetune_demo_path."
+                )
+
+            if self.use_timing_profile and self.use_bc_loss and self.use_finetune_demo_for_bc:
                 bc_start = time.perf_counter()
-            # Backward-compatible BC:
-            # - Default behavior (use_finetune_demo_for_bc=False): compute BC only on demo samples mixed into replay batch.
-            # - Finetune behavior (use_finetune_demo_for_bc=True): compute BC on a separate finetune demo buffer.
-            if self.use_bc_loss:
-                use_finetune_bc = bool(self.use_finetune_demo_for_bc)
-                if use_finetune_bc:
+
+            if self.use_bc_loss and self.use_finetune_demo_for_bc:
                     if self._finetune_demo_buffer is None:
                         raise RuntimeError("finetune_demo_path must be provided when use_finetune_demo_for_bc is True")
 
@@ -776,72 +778,13 @@ class HSAC_DEX(HSAC):
                     q_filter_pass_ratios.append(float(q_filter_mask.mean().item()))
 
                     actor_total_loss = actor_loss + float(weight_bc_id) * bc_id + float(weight_bc_param) * bc_param
-
-                else:
-                    # Legacy path: only compute BC when demo samples are mixed into replay batch.
-                    if demo_replay_batch > 0:
-                        if replay_batch > 0:
-                            demo_slice = slice(replay_batch, replay_batch + demo_replay_batch)
-                        else:
-                            demo_slice = slice(0, demo_replay_batch)
-
-                        demo_obs_for_bc = {
-                            key: replay_data.observations[key][demo_slice]
-                            for key in replay_data.observations.keys()
-                        }
-                        demo_target_ids = replay_data.actions[self.d_key][demo_slice].long().view(-1)
-                        demo_target_params = replay_data.actions[self.c_key][demo_slice]
-
-                        # Use logits CE for discrete BC so gradients flow through the task policy.
-                        demo_task_logits = self.actor.get_task_dist_params(demo_obs_for_bc)
-                        bc_id_loss = F.cross_entropy(demo_task_logits, demo_target_ids)
-
-                        # Regress continuous params conditioned on target discrete action.
-                        demo_mean_actions, _, _ = self.actor.get_param_dist_params(demo_obs_for_bc, demo_target_ids)
-                        demo_mask = self.actor.param_mask[demo_target_ids.long()]
-                        demo_pred_params = th.tanh(demo_mean_actions)
-                        # Normalize masked MSE by each sample's valid parameter dims to avoid scale bias.
-                        param_sq_error = (demo_pred_params - demo_target_params).pow(2) * demo_mask
-                        valid_dims = demo_mask.sum(dim=1).clamp_min(1.0)
-                        bc_param_loss = (param_sq_error.sum(dim=1) / valid_dims).mean()
-                        bc_loss = bc_id_loss + bc_param_loss
-
-                    actor_total_loss = actor_loss + self.demo_bc_weight * bc_loss
             else:
                 actor_total_loss = actor_loss
-
-            if self.use_bc_loss and demo_replay_batch > 0:
-                if replay_batch > 0:
-                    demo_slice = slice(replay_batch, replay_batch + demo_replay_batch)
-                else:
-                    demo_slice = slice(0, demo_replay_batch)
-
-                demo_obs_for_bc = {
-                    key: replay_data.observations[key][demo_slice]
-                    for key in replay_data.observations.keys()
-                }
-                demo_target_ids = replay_data.actions[self.d_key][demo_slice].long().view(-1)
-                demo_target_params = replay_data.actions[self.c_key][demo_slice]
-
-                # Use logits CE for discrete BC so gradients flow through the task policy.
-                demo_task_logits = self.actor.get_task_dist_params(demo_obs_for_bc)
-                bc_id_loss = F.cross_entropy(demo_task_logits, demo_target_ids)
-
-                # Regress continuous params conditioned on target discrete action.
-                demo_mean_actions, _, _ = self.actor.get_param_dist_params(demo_obs_for_bc, demo_target_ids)
-                demo_mask = self.actor.param_mask[demo_target_ids.long()]
-                demo_pred_params = th.tanh(demo_mean_actions)
-                # Normalize masked MSE by each sample's valid parameter dims to avoid scale bias.
-                param_sq_error = (demo_pred_params - demo_target_params).pow(2) * demo_mask
-                valid_dims = demo_mask.sum(dim=1).clamp_min(1.0)
-                bc_param_loss = (param_sq_error.sum(dim=1) / valid_dims).mean()
-                bc_loss = bc_id_loss + bc_param_loss
 
             if self.use_timing_profile and bc_start is not None:
                 bc_times.append(time.perf_counter() - bc_start)
 
             bc_losses.append(bc_loss.item())
-            actor_total_loss = actor_loss + self.demo_bc_weight * bc_loss
 
             if self.use_timing_profile:
                 actor_start = time.perf_counter()
