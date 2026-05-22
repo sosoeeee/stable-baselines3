@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import numpy as np
 from typing import Optional, Tuple
 
@@ -144,34 +145,47 @@ class HSAC_DEX(HSAC):
         # Optional: load a separate demo buffer for human-style fine-tuning.
         # By default, this has NO side effects on training unless explicitly used.
         if self.finetune_demo_path is not None:
-            finetune_kwargs = dict(self.finetune_demo_buffer_kwargs or self.demo_buffer_kwargs)
-            finetune_kwargs.setdefault("env", self.env)
-            self._finetune_demo_buffer = DemoBuffer.from_npz(
-                path=self.finetune_demo_path,
-                observation_space=self.observation_space,
-                action_space=self.action_space,
-                device=self.device,
-                **finetune_kwargs,
-            )
-            self.finetune_demo_batch_size = min(self.finetune_demo_batch_size, self._finetune_demo_buffer.size())
+            # Finetune demos should be optional at load/eval time.
+            # If the path does not exist on the current machine, warn and skip.
+            if not (os.path.isfile(self.finetune_demo_path) or os.path.isdir(self.finetune_demo_path)):
+                print(
+                    f"Warning: finetune_demo_path '{self.finetune_demo_path}' not found. "
+                    "Skipping finetune demo buffer load (ok for eval)."
+                )
+                self._finetune_demo_buffer = None
+            else:
+                finetune_kwargs = dict(self.finetune_demo_buffer_kwargs or self.demo_buffer_kwargs)
+                finetune_kwargs.setdefault("env", self.env)
+                self._finetune_demo_buffer = DemoBuffer.from_npz(
+                    path=self.finetune_demo_path,
+                    observation_space=self.observation_space,
+                    action_space=self.action_space,
+                    device=self.device,
+                    **finetune_kwargs,
+                )
+                self.finetune_demo_batch_size = min(
+                    self.finetune_demo_batch_size, self._finetune_demo_buffer.size()
+                )
 
-            if self.finetune_update_vecnormalize_stats:
-                finetune_size = self._finetune_demo_buffer.pos
-                vec_normalize = unwrap_vec_normalize(self.env)
-                if vec_normalize is not None and finetune_size > 0:
-                    print("Updating VecNormalize statistics with finetune demonstration data...")
-                    if vec_normalize.norm_obs:
-                        finetune_obs = {
-                            key: self._finetune_demo_buffer.observations[key][:finetune_size].copy()
-                            for key in self._finetune_demo_buffer.observations
-                        }
-                        vec_normalize.update_from_data(observations=finetune_obs, rewards=None)
-                        print(f"  ✓ Updated observation statistics from {finetune_size} finetune demo transitions")
-                    if vec_normalize.norm_reward:
-                        finetune_rewards = self._finetune_demo_buffer.rewards[:finetune_size].copy()
-                        vec_normalize.update_from_data(observations=None, rewards=finetune_rewards)
-                        print(f"  ✓ Updated reward statistics from {finetune_size} finetune demo transitions")
-                    print("✓ VecNormalize statistics updated with finetune demonstrations\n")
+                if self.finetune_update_vecnormalize_stats:
+                    finetune_size = self._finetune_demo_buffer.pos
+                    vec_normalize = unwrap_vec_normalize(self.env)
+                    if vec_normalize is not None and finetune_size > 0:
+                        print("Updating VecNormalize statistics with finetune demonstration data...")
+                        if vec_normalize.norm_obs:
+                            finetune_obs = {
+                                key: self._finetune_demo_buffer.observations[key][:finetune_size].copy()
+                                for key in self._finetune_demo_buffer.observations
+                            }
+                            vec_normalize.update_from_data(observations=finetune_obs, rewards=None)
+                            print(
+                                f"  ✓ Updated observation statistics from {finetune_size} finetune demo transitions"
+                            )
+                        if vec_normalize.norm_reward:
+                            finetune_rewards = self._finetune_demo_buffer.rewards[:finetune_size].copy()
+                            vec_normalize.update_from_data(observations=None, rewards=finetune_rewards)
+                            print(f"  ✓ Updated reward statistics from {finetune_size} finetune demo transitions")
+                        print("✓ VecNormalize statistics updated with finetune demonstrations\n")
 
 
     def _compute_propagated_actions(
